@@ -14,6 +14,19 @@
 # status list). Keep platform-specific work tagged so unsupported nodes never
 # appear on the other lane.
 
+# A leaf may also be SHARDED across the platform's venue pool with
+# `[metadata("odu:shard=N")]`. N is a CEILING, not a reservation: odu takes
+# whatever slots are free (one of them is the run's own primary box), tells
+# every slice the total it actually got in `ODU_SHARD_TOTAL`, and numbers the
+# slices from ZERO in `ODU_SHARD_INDEX`. The leaf divides its own work from that
+# pair, so the work stays whole whatever total comes back. Each borrowed box
+# also runs its own copy of the leaf's dependency closure, which is what the
+# `<recipe>[k-of-N]` and `<recipe>[k-of-N]::<dep>` nodes are — a leaf earns a
+# shard only by being slower than that burst. Every slice folds into the ONE
+# `<recipe>@<platform>` GitHub context, whose duration is the slowest slice, so
+# ci/protect never grows a shard name. Our darwin pool is a single host, so
+# nothing is ever free to borrow there and every darwin lane resolves to TOTAL=1.
+
 # Submodule recipes default to running from the submodule's directory (`ci/`),
 # but commands like `nix build … --override-input flake .` and `nix develop -c`
 # expect the repo root. Pin the working directory once instead of cd'ing in
@@ -200,7 +213,32 @@ agent-bake: nix
 # `just test` builds `.#koluBin` itself (justfile `test` recipe). Depend on
 # `nix` as well as the shared pnpm install so that build is an already-realized
 # lookup, not a concurrent Nix build.
+#
+# The only sharded leaf (the shard contract is at the top of this file): the
+# browser suite is the longest pole on the Linux lane and dwarfs the burst
+# `install`+`nix` copies a borrowed box pays, so it is worth up to four slots.
+# Cucumber owns the actual split (`CUCUMBER_SHARD`, packages/tests/cucumber.js);
+# this recipe only translates odu's zero-based index into Cucumber's one-based
+# one, and refuses a pair that does not parse. With neither variable set — a
+# local `just ci::e2e`, and every darwin lane — this is the command it has
+# always been.
+[metadata("odu:shard=4")]
 e2e: install nix
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Fail loud on a half-set or out-of-range pair rather than silently running
+    # the whole suite N times (or no scenarios at all): a shard variable that
+    # does not parse is a runner bug, and a green lane would hide it.
+    if [[ -n "${ODU_SHARD_INDEX:-}" || -n "${ODU_SHARD_TOTAL:-}" ]]; then
+      if [[ ! "${ODU_SHARD_INDEX:-}" =~ ^(0|[1-9][0-9]*)$ ]] \
+        || [[ ! "${ODU_SHARD_TOTAL:-}" =~ ^[1-9][0-9]*$ ]] \
+        || ((ODU_SHARD_INDEX >= ODU_SHARD_TOTAL)); then
+        echo "ci::e2e: invalid shard pair ODU_SHARD_INDEX='${ODU_SHARD_INDEX:-}' ODU_SHARD_TOTAL='${ODU_SHARD_TOTAL:-}'" >&2
+        exit 2
+      fi
+      export CUCUMBER_SHARD="$((ODU_SHARD_INDEX + 1))/$ODU_SHARD_TOTAL"
+      echo "e2e: shard=$CUCUMBER_SHARD (odu index=$ODU_SHARD_INDEX of $ODU_SHARD_TOTAL)"
+    fi
     # CUCUMBER_RETRY is the residual safety net for darwin-runner-load flakes
     # that survive the structural fixes in #955. Darwin runs at 2, linux at 1:
     # the darwin residual is an fs-event-drop class (e.g. the live-reload
