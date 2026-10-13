@@ -1,7 +1,7 @@
-import { GIB, MIB } from "@kolu/byte-units";
 import { describe, expect, it } from "vitest";
 import { agentBundleShortHash } from "./bundle.ts";
 import { type AgentDistroListing, profileOfBundle } from "./listing.ts";
+import { lastRunOf, recentEvents } from "./history.ts";
 import type { AgentDistroReceipt, AgentDistroStatus } from "./schema.ts";
 import {
   AGENTS_CUSTOM,
@@ -19,26 +19,16 @@ import {
   RECENT_PROFILES_CAP,
   rememberProfile,
   AGENTS_CHECK_NOW,
-  agentHostCheckable,
-  agentMarkFillWords,
   AGENTS_RECEIPT_UNREADABLE,
-  AGENTS_UPDATE_CHECKING,
-  agentMarkFill,
-  agentMarkUpdate,
   AGENTS_UPDATE_DOWNLOADING,
-  agentUpdateCheckable,
-  agentUpdateRunning,
   agentsStepHint,
   agentDistroChoice,
   agentDistroSettingOf,
   agentsChosen,
   agentsChosenLabel,
   firstRunAgentsDone,
-  AGENTS_RETRY,
+  AGENTS_DELIVERY_AGAIN,
   agentFailureLines,
-  agentFailureRemedy,
-  agentMarkWords,
-  DOWNLOAD_MIN_FILL,
   agentMarkLabel,
   agentChipLabel,
   agentMarkOf,
@@ -49,9 +39,8 @@ import {
   agentToast,
   AGENTS_OFF_MEANS,
   agentsHint,
-  downloadBytes,
-  downloadEdge,
-  downloadEdgeFacts,
+  landedFacts,
+  updateLanded,
   restartedLabel,
 } from "./status.ts";
 import { bundleFiles, readFrom } from "./testing.ts";
@@ -71,33 +60,52 @@ describe("agentMarkOf — the one status → treatment fold", () => {
     ],
     [
       "ready",
-      { kind: "ready", profile: "vanilla", bundle: READY_BUNDLE },
-      { kind: "ready", profile: "vanilla", hash: "nd11nx5f" },
-    ],
-    [
-      "downloading with bytes",
       {
-        kind: "downloading",
+        kind: "ready",
         profile: "vanilla",
-        progress: { done: 1.1 * GIB, total: 2 * GIB },
+        bundle: READY_BUNDLE,
+        delivering: false,
       },
-      { kind: "downloading", fraction: 0.55, bytes: "1.1 GiB of 2.0 GiB" },
+      {
+        kind: "ready",
+        profile: "vanilla",
+        hash: "nd11nx5f",
+        delivering: false,
+      },
     ],
     [
-      "downloading, no numbers yet",
+      "ready, delivering a newer set",
+      {
+        kind: "ready",
+        profile: "vanilla",
+        bundle: READY_BUNDLE,
+        delivering: true,
+      },
+      {
+        kind: "ready",
+        profile: "vanilla",
+        hash: "nd11nx5f",
+        delivering: true,
+      },
+    ],
+    [
+      "undelivered: no mark, nothing turning",
+      { kind: "undelivered", profile: "vanilla" },
+      { kind: "none", why: "undelivered" },
+    ],
+    [
+      "downloading",
       { kind: "downloading", profile: "vanilla" },
-      // Nothing counted yet still shows a sliver — never an empty track.
-      { kind: "downloading", fraction: DOWNLOAD_MIN_FILL, bytes: undefined },
+      { kind: "downloading" },
     ],
     [
       "error",
       {
         kind: "error",
         profile: "vanilla",
-        reason: "updater",
         message: "cache not usable",
       },
-      { kind: "failed", reason: "updater", message: "cache not usable" },
+      { kind: "failed", message: "cache not usable" },
     ],
   ];
   for (const [name, status, mark] of cases)
@@ -105,16 +113,6 @@ describe("agentMarkOf — the one status → treatment fold", () => {
 
   it("checking wins until the first frame — derived on the client, no server state", () => {
     expect(agentMarkOf(undefined, true)).toEqual({ kind: "checking" });
-  });
-});
-
-describe("downloadBytes", () => {
-  it("says no numbers when there are none — including a 0-byte total", () => {
-    expect(downloadBytes(undefined)).toBeUndefined();
-    expect(downloadBytes({ done: 0, total: 0 })).toBeUndefined();
-    expect(downloadBytes({ done: 603 * MIB, total: 2.2 * GIB })).toBe(
-      "603 MiB of 2.2 GiB",
-    );
   });
 });
 
@@ -128,7 +126,12 @@ describe("agentMarkLabel", () => {
     );
     expect(
       agentMarkLabel(
-        { kind: "ready", profile: "vanilla", hash: "8rcmf6rd" },
+        {
+          kind: "ready",
+          profile: "vanilla",
+          hash: "8rcmf6rd",
+          delivering: false,
+        },
         "box",
       ),
     ).toBe(
@@ -137,20 +140,23 @@ describe("agentMarkLabel", () => {
     expect(
       agentMarkLabel(
         {
-          kind: "downloading",
-          fraction: 0.55,
-          bytes: "1.1 GiB of 2.0 GiB",
+          kind: "ready",
+          profile: "vanilla",
+          hash: "8rcmf6rd",
+          delivering: true,
         },
-        "naiveintent",
-      ),
-    ).toBe("Downloading the coding agents to naiveintent… 1.1 GiB of 2.0 GiB");
-    expect(
-      agentMarkLabel(
-        { kind: "failed", reason: "updater", message: "nix missing" },
         "box",
       ),
     ).toBe(
-      `The coding agents could not be downloaded to box: nix missing\n${AGENTS_RETRY}`,
+      `Coding agents ready on box: vanilla (8rcmf6rd) — new terminals on box start with them\n${AGENTS_UPDATE_DOWNLOADING}`,
+    );
+    expect(agentMarkLabel({ kind: "downloading" }, "naiveintent")).toBe(
+      "Delivering the coding agents to naiveintent…",
+    );
+    expect(
+      agentMarkLabel({ kind: "failed", message: "nix missing" }, "box"),
+    ).toBe(
+      `The coding agents could not be delivered to box: nix missing\n${AGENTS_DELIVERY_AGAIN}`,
     );
   });
 });
@@ -350,7 +356,6 @@ describe("agentChips — the agents the Agents row names", () => {
             { name: "claude", title: "Claude Code", version: "3.0.0" },
           ],
           events: [],
-          running: [],
         },
       }),
     ).toEqual([{ title: "Claude Code", version: "3.0.0" }]);
@@ -390,7 +395,6 @@ describe("agentChips — the agents the Agents row names", () => {
       bundle: "/s/v",
       versions: [...parseVersions(read(versionsFile("/s/v")))],
       events: [],
-      running: [],
     };
     expect(chips(receipt)).toEqual(chips(undefined));
     expect(chips(undefined)).toEqual([
@@ -597,12 +601,17 @@ describe("firstRunAgentsDone — the first-run step's done-predicate", () => {
   const STATUSES = {
     off: { kind: "off" },
     unavailable: { kind: "unavailable" },
+    undelivered: { kind: "undelivered", profile: "vanilla" },
     downloading: { kind: "downloading", profile: "vanilla" },
-    ready: { kind: "ready", profile: "vanilla", bundle: BUNDLE },
+    ready: {
+      kind: "ready",
+      profile: "vanilla",
+      bundle: BUNDLE,
+      delivering: false,
+    },
     error: {
       kind: "error",
       profile: "vanilla",
-      reason: "updater",
       message: "m",
     },
   } as const satisfies {
@@ -638,6 +647,7 @@ describe("firstRunAgentsDone — the first-run step's done-predicate", () => {
       // padi still off: the push has not landed (a reload, a server restart).
       off: undefined,
       unavailable: true,
+      undelivered: false,
       downloading: false,
       ready: true,
       error: false,
@@ -758,7 +768,12 @@ describe("firstRunAgentsDone — the first-run step's done-predicate", () => {
 const AGO = (at: number) => `@${at}`;
 
 describe("agentFleetSummary — the ONE fleet line in Settings", () => {
-  const ready = { kind: "ready", profile: "vanilla", bundle: BUNDLE } as const;
+  const ready = {
+    kind: "ready",
+    profile: "vanilla",
+    bundle: BUNDLE,
+    delivering: false,
+  } as const;
   const host = (
     label: string,
     status: AgentDistroStatus | undefined,
@@ -791,15 +806,10 @@ describe("agentFleetSummary — the ONE fleet line in Settings", () => {
       host("naiveintent", ready),
       host("box", ready),
       host("zest", ready),
-      host("buildbox", {
-        kind: "downloading",
-        profile: "vanilla",
-        progress: { done: 1.1 * GIB, total: 2 * GIB },
-      }),
+      host("buildbox", { kind: "downloading", profile: "vanilla" }),
       host("devbox", {
         kind: "error",
         profile: "vanilla",
-        reason: "updater",
         message: "cache not usable",
       }),
     ]);
@@ -810,7 +820,7 @@ describe("agentFleetSummary — the ONE fleet line in Settings", () => {
         hosts: ["naiveintent", "box"],
         trail: "and 1 more",
       },
-      { tone: "busy", lead: "", hosts: ["buildbox"], trail: "downloading" },
+      { tone: "busy", lead: "", hosts: ["buildbox"], trail: "delivering" },
       { tone: "warn", lead: "", hosts: ["devbox"], trail: "failed" },
     ]);
     // With more than one machine no run is named here: each machine's runs
@@ -838,7 +848,12 @@ describe("agentFleetSummary — the ONE fleet line in Settings", () => {
 });
 
 describe("agentHostDetail — one machine's agents, in its host details", () => {
-  const ready = { kind: "ready", profile: "vanilla", bundle: BUNDLE } as const;
+  const ready = {
+    kind: "ready",
+    profile: "vanilla",
+    bundle: BUNDLE,
+    delivering: false,
+  } as const;
   const detail = (
     status: AgentDistroStatus | undefined,
     receipt?: AgentDistroReceipt,
@@ -855,9 +870,21 @@ describe("agentHostDetail — one machine's agents, in its host details", () => 
       profile: "Vanilla",
       hash: "nd11nx5f",
       state: { text: "ready", title: "ready", tone: "muted" },
-      cause: [],
       events: [],
-      action: "check",
+      canCheck: true,
+    });
+  });
+
+  it("undelivered: the profile and a still state line, and no check to run", () => {
+    expect(detail({ kind: "undelivered", profile: "vanilla" })).toEqual({
+      profile: "Vanilla",
+      state: {
+        text: "no coding agents delivered",
+        title: "no coding agents delivered",
+        tone: "muted",
+      },
+      events: [],
+      canCheck: false,
     });
   });
 
@@ -866,8 +893,7 @@ describe("agentHostDetail — one machine's agents, in its host details", () => 
       profile: "vanilla",
       bundle: BUNDLE,
       versions: [],
-      running: [],
-      lastRun: { at: 3, outcome: "updated", by: "updater", words: "C 1 → 2" },
+      lastRun: { at: 3, outcome: "updated", by: "log", words: "C 1 → 2" },
       events: [
         {
           at: "1970-01-01T00:00:00.003Z",
@@ -883,62 +909,47 @@ describe("agentHostDetail — one machine's agents, in its host details", () => 
         when: "@3",
         kind: "updated",
         text: "C 1 → 2",
-        title: "updated — agent-distro's updater: C 1 → 2",
+        title: "updated — the host's update log: C 1 → 2",
         tone: "muted",
       },
     ]);
   });
 
-  it("a run in flight says so, and offers no check while it runs", () => {
-    expect(detail({ ...ready, update: {} })?.state.text).toBe(
-      `ready · ${AGENTS_UPDATE_CHECKING}`,
-    );
-    expect(detail({ ...ready, update: {} })?.action).toBeUndefined();
-    expect(
-      detail({
-        ...ready,
-        update: { progress: { done: 1.1 * GIB, total: 2 * GIB } },
-      })?.state.text,
-    ).toBe("ready · updating · 1.1 GiB of 2.0 GiB");
+  it("a delivery in flight says so, and offers no check while it runs", () => {
+    const d = detail({ ...ready, delivering: true });
+    expect(d?.state.text).toBe("ready · delivering newer agents…");
+    expect(d?.canCheck).toBe(false);
   });
 
-  it("failed: the cause in agent-distro's words, what it means there, and a retry", () => {
+  it("failed: the cause in kolu-server's words, what it means there, and a check to try again", () => {
     expect(
       detail({
         kind: "error",
         profile: "vanilla",
-        reason: "nixMissing",
-        message: "nix is not on padi's PATH",
+        message: "the cache does not hold this bundle",
       }),
     ).toEqual({
       profile: "Vanilla",
       state: {
-        text: "download failed",
-        title: "nix is not on padi's PATH",
+        text: "delivery failed",
+        title: "the cache does not hold this bundle",
         tone: "warn",
       },
-      cause: ["nix is not on padi's PATH", agentFailureRemedy("nixMissing")],
-      means:
-        "New terminals on devbox get no coding agents until this is fixed.",
+      cause: "the cache does not hold this bundle",
+      means: `New terminals on devbox get no coding agents until this is fixed. ${AGENTS_DELIVERY_AGAIN}`,
       events: [],
-      action: "retry",
+      canCheck: true,
     });
   });
 
-  it("downloading and off say what they are, with nothing to do from here", () => {
-    expect(
-      detail({
-        kind: "downloading",
-        profile: "vanilla",
-        progress: { done: 1.1 * GIB, total: 2 * GIB },
-      }),
-    ).toMatchObject({
-      state: { text: "downloading · 1.1 GiB of 2.0 GiB" },
-      action: undefined,
+  it("delivering and off say what they are, with nothing to do from here", () => {
+    expect(detail({ kind: "downloading", profile: "vanilla" })).toMatchObject({
+      state: { text: "delivering…" },
+      canCheck: false,
     });
     expect(detail({ kind: "off" })).toMatchObject({
       state: { text: "agents off" },
-      action: undefined,
+      canCheck: false,
     });
   });
 
@@ -959,7 +970,6 @@ describe("agentHostDetail — one machine's agents, in its host details", () => 
         profile: "vanilla",
         bundle: BUNDLE,
         versions: [],
-        running: [],
         events: [],
         error: "the history file is not a history",
       })?.events,
@@ -986,7 +996,7 @@ describe("agentStalenessOf — is a terminal's agents what a new one gets", () =
   const had = { profile: "vanilla", hash: "nd11nx5f" };
   const on = (profile: string) => ({ enabled: true, profile });
   const ready = (profile: string, bundle: string) =>
-    ({ kind: "ready", profile, bundle }) as const;
+    ({ kind: "ready", profile, bundle, delivering: false }) as const;
 
   it("a reference switch on the same bundle is stale: its AI_PROFILE changed", () => {
     expect(
@@ -1062,7 +1072,6 @@ describe("agentStalenessOf — is a terminal's agents what a new one gets", () =
         status: {
           kind: "error",
           profile: "juspay",
-          reason: "updater",
           message: "m",
         },
         setting: on("juspay"),
@@ -1127,7 +1136,6 @@ describe("agentStalenessOf — is a terminal's agents what a new one gets", () =
         status: {
           kind: "error",
           profile: "vanilla",
-          reason: "updater",
           message: "m",
         },
         setting: on("vanilla"),
@@ -1190,7 +1198,7 @@ describe("agentStaleLabel", () => {
       "This terminal has the vanilla coding agents (nd11nx5f). Coding agents are now off. Restart to switch; it comes back as a plain shell, and running programs end.",
     );
   });
-  it("the new profile still downloading: says so, no Restart yet", () => {
+  it("the new profile still being delivered: says so, no Restart yet", () => {
     expect(
       agentStaleLabel(
         {
@@ -1201,7 +1209,7 @@ describe("agentStaleLabel", () => {
         "naiveintent",
       ),
     ).toBe(
-      "This terminal has the vanilla coding agents (nd11nx5f). New terminals get juspay, which is still downloading to naiveintent; Restart appears once it is ready.",
+      "This terminal has the vanilla coding agents (nd11nx5f). New terminals get juspay, which is still being delivered to naiveintent; Restart appears once it is ready.",
     );
   });
   it("the download failed: new terminals get none, no Restart yet", () => {
@@ -1215,7 +1223,7 @@ describe("agentStaleLabel", () => {
         "naiveintent",
       ),
     ).toBe(
-      "This terminal has the vanilla coding agents (nd11nx5f). vanilla could not be downloaded to naiveintent, so new terminals get no coding agents; Restart appears once it is ready.",
+      "This terminal has the vanilla coding agents (nd11nx5f). vanilla could not be delivered to naiveintent, so new terminals get no coding agents; Restart appears once it is ready.",
     );
   });
   it("the restart's consequence is agentRestartAction's own words", () => {
@@ -1320,106 +1328,54 @@ describe("the words outside the folds", () => {
   });
 });
 
-describe("downloadEdge — the moments a host's download is worth a toast", () => {
-  const k = (kind: AgentDistroStatus["kind"]) => ({ kind });
-  const ready = (bundle: string, profile = "vanilla") => ({
-    kind: "ready" as const,
-    profile,
-    bundle,
+describe("updateLanded — the moment a delivery is worth the updated toast", () => {
+  const ready = (bundle: string, profile = "vanilla") =>
+    landedFacts({ kind: "ready", profile, bundle, delivering: false });
+
+  it("a new bundle of the SAME profile on a ready host is an update", () => {
+    expect(updateLanded(ready("/a"), ready("/b"))).toBe(true);
+    expect(updateLanded(ready("/a"), ready("/a"))).toBe(false);
   });
-  it("start when a download begins or is first heard under way; ready / failed only out of a download", () => {
-    expect(downloadEdge(k("off"), k("downloading"))).toBe("start");
-    expect(downloadEdge(undefined, k("downloading"))).toBe("start");
-    expect(downloadEdge(k("downloading"), k("downloading"))).toBe("none");
-    expect(downloadEdge(k("downloading"), ready("/a"))).toBe("ready");
-    expect(downloadEdge(k("downloading"), k("error"))).toBe("failed");
-    expect(downloadEdge(undefined, ready("/a"))).toBe("none");
-    expect(downloadEdge(k("off"), k("error"))).toBe("none");
-    expect(downloadEdge(ready("/a"), undefined)).toBe("none");
+  it("a first delivery, a profile switch, or a host going off is not", () => {
+    expect(updateLanded(undefined, ready("/a"))).toBe(false);
+    expect(updateLanded(ready("/a"), ready("/b", "juspay"))).toBe(false);
+    expect(updateLanded(ready("/a"), landedFacts({ kind: "off" }))).toBe(false);
   });
-  it("dropped when agents are turned off under a running download", () => {
-    expect(downloadEdge(k("downloading"), k("off"))).toBe("dropped");
-    expect(downloadEdge(k("downloading"), k("unavailable"))).toBe("dropped");
-    expect(downloadEdge(ready("/a"), k("off"))).toBe("none");
-  });
-  it("updated when a ready host's bundle of the SAME profile changes — never on a switch", () => {
-    expect(downloadEdge(ready("/a"), ready("/b"))).toBe("updated");
-    expect(downloadEdge(ready("/a"), ready("/a"))).toBe("none");
-    expect(downloadEdge(ready("/a"), ready("/b", "juspay"))).toBe("none");
-  });
-  it("reads its facts off a status, by value", () => {
+  it("reads its facts off a ready status, by value — an update in flight changes nothing", () => {
     expect(
-      downloadEdgeFacts({
+      landedFacts({
         kind: "ready",
         profile: "vanilla",
         bundle: "/a",
-        update: {},
+        delivering: true,
       }),
-    ).toEqual({ kind: "ready", profile: "vanilla", bundle: "/a" });
-    expect(downloadEdgeFacts({ kind: "off" })).toEqual({ kind: "off" });
-    expect(downloadEdgeFacts(undefined)).toBeUndefined();
+    ).toEqual({ profile: "vanilla", bundle: "/a" });
+    expect(
+      landedFacts({ kind: "downloading", profile: "vanilla" }),
+    ).toBeUndefined();
+    expect(landedFacts(undefined)).toBeUndefined();
   });
 });
 
-describe("a failure's words: cause, then remedy (by reason), then the retry — each once", () => {
-  it("nixMissing carries the host-setup remedy; the retry appears exactly once", () => {
-    const label =
-      agentMarkLabel(
-        {
-          kind: "failed",
-          reason: "nixMissing",
-          message: "nix is not on padi's PATH on this host",
-        },
-        "box",
-      ) ?? "";
-    const lines = label.split("\n");
-    expect(lines[0]).toBe(
-      "The coding agents could not be downloaded to box: nix is not on padi's PATH on this host",
-    );
-    expect(lines[1]).toBe(agentFailureRemedy("nixMissing"));
-    expect(lines.filter((l) => l === AGENTS_RETRY)).toHaveLength(1);
-    expect(lines).toHaveLength(3);
-  });
-  it("an updater failure is its own words, then the retry", () => {
-    expect(agentFailureRemedy("updater")).toBeUndefined();
-    expect(
-      agentFailureLines(
-        { reason: "updater", message: "cache not usable" },
-        "box",
-      ),
-    ).toEqual([
-      "The coding agents could not be downloaded to box: cache not usable",
-      AGENTS_RETRY,
+describe("a failure's words: its cause, then when kolu tries again — each once", () => {
+  const CAUSE =
+    "agent-distro's cache did not deliver the vanilla agents for x86_64-linux";
+
+  it("a delivery failure is its own words, then when kolu tries again", () => {
+    expect(agentFailureLines({ message: CAUSE }, "box")).toEqual([
+      `The coding agents could not be delivered to box: ${CAUSE}`,
+      AGENTS_DELIVERY_AGAIN,
     ]);
   });
-  it("a failure with nix's own line: the toast's title is the cause and nix's line, on one line", () => {
-    const message =
-      "cannot resolve flake: unable to download 'https://api.github.com/repos/o/r/commits/HEAD': HTTP error 401";
-    const words = agentMarkWords(
-      { kind: "failed", reason: "updater", message },
-      "nix-infra@idli-01",
-    );
-    expect(words).toEqual({
-      title: `The coding agents could not be downloaded to nix-infra@idli-01: ${message}`,
-      detail: [AGENTS_RETRY],
-    });
-  });
-  it("the hover, the toast and the machine's own section say the same words", () => {
-    const failure = {
-      reason: "nixMissing",
-      message: "nix is not on padi's PATH on this host",
-    } as const;
+  it("the hover and the machine's own section say the same words", () => {
+    const failure = { message: CAUSE } as const;
     const lines = agentFailureLines(failure, "box");
-    const mark = { kind: "failed", ...failure } as const;
     // Hover / accessible name.
-    expect(agentMarkLabel(mark, "box")).toBe(lines.join("\n"));
-    // Toast: the cause as its title, the rest as its description.
-    expect(agentMarkWords(mark, "box")).toEqual({
-      title: lines[0],
-      detail: lines.slice(1),
-    });
-    // The machine's own host-details section: the cause and the remedy, with
-    // the retry its BUTTON rather than a sentence.
+    expect(agentMarkLabel({ kind: "failed", ...failure }, "box")).toBe(
+      lines.join("\n"),
+    );
+    // The machine's own host-details section: the cause, with trying again
+    // its check BUTTON beside the one sentence of when.
     const detail = agentHostDetail({
       host: {
         label: "box",
@@ -1431,24 +1387,24 @@ describe("a failure's words: cause, then remedy (by reason), then the retry — 
       setting: VANILLA_ON,
       listing: LISTING,
     });
-    expect(detail?.cause).toEqual([failure.message, lines[1]]);
-    expect(lines.at(-1)).toBe(AGENTS_RETRY);
-    expect(detail?.action).toBe("retry");
+    expect(detail?.cause).toBe(CAUSE);
+    expect(detail?.means?.endsWith(AGENTS_DELIVERY_AGAIN)).toBe(true);
+    expect(detail?.canCheck).toBe(true);
   });
 });
 
 describe("K3 — updates while a bundle serves", () => {
-  const ready = { kind: "ready", profile: "vanilla", bundle: BUNDLE } as const;
-  const checking = { ...ready, update: {} } as const;
-  const downloading = {
-    ...ready,
-    update: { progress: { done: 512 * MIB, total: 2 * GIB } },
+  const ready = {
+    kind: "ready",
+    profile: "vanilla",
+    bundle: BUNDLE,
+    delivering: false,
   } as const;
+  const delivering = { ...ready, delivering: true } as const;
   const receipt = (over: Partial<AgentDistroReceipt>): AgentDistroReceipt => ({
     profile: "vanilla",
     versions: [],
     events: [],
-    running: [],
     ...over,
   });
   const host = (
@@ -1462,34 +1418,20 @@ describe("K3 — updates while a bundle serves", () => {
     ago: AGO,
   });
 
-  it("the mark stays ready while an update runs; a ring only once bytes move", () => {
-    expect(agentMarkOf(checking, false)).toEqual({
+  it("the mark stays ready while a newer set is delivered, and says so", () => {
+    const mark = agentMarkOf(delivering, false);
+    expect(mark).toEqual({
       kind: "ready",
       profile: "vanilla",
       hash: "nd11nx5f",
-      update: {},
+      delivering: true,
     });
-    const mark = agentMarkOf(downloading, false);
-    expect(mark).toMatchObject({
-      kind: "ready",
-      update: { download: { fraction: 0.25, bytes: "512 MiB of 2.0 GiB" } },
-    });
-    expect(agentMarkWords(mark, "box")?.detail).toEqual([
+    expect(agentMarkLabel(mark, "box")?.split("\n").slice(1)).toEqual([
       AGENTS_UPDATE_DOWNLOADING,
     ]);
-    expect(agentMarkWords(agentMarkOf(checking, false), "box")?.detail).toEqual(
-      ["Checking for newer agents…"],
+    expect(agentMarkLabel(agentMarkOf(ready, false), "box")).not.toContain(
+      "\n",
     );
-    // One fold for the phase and the fill, the tab's ring and the line alike.
-    expect(agentMarkUpdate(agentMarkOf(checking, false))).toBe("checking");
-    expect(agentMarkUpdate(mark)).toBe("downloading");
-    expect(agentMarkUpdate(agentMarkOf(ready, false))).toBeUndefined();
-    expect(agentMarkFill(mark)).toEqual({
-      fraction: 0.25,
-      bytes: "512 MiB of 2.0 GiB",
-    });
-    expect(agentMarkFill(agentMarkOf(checking, false))).toBeUndefined();
-    expect(agentMarkLabel(mark, "box")).toContain("512 MiB of 2.0 GiB");
   });
 
   it("a ready machine's state line says its last run, in its own outcome's words", () => {
@@ -1502,18 +1444,18 @@ describe("K3 — updates while a bundle serves", () => {
     expect(
       state(
         receipt({
-          lastRun: { at: 1, outcome: "updated", words: "x", by: "updater" },
+          lastRun: { at: 1, outcome: "updated", words: "x", by: "log" },
         }),
       ),
     ).toEqual({
       text: "ready · updated @1",
-      title: "updated @1 — agent-distro's updater: x",
+      title: "updated @1 — the host's update log: x",
       tone: "muted",
     });
     expect(
       state(
         receipt({
-          lastRun: { at: 2, outcome: "unchanged", words: "", by: "updater" },
+          lastRun: { at: 2, outcome: "unchanged", words: "", by: "log" },
         }),
       ),
     ).toEqual({
@@ -1527,7 +1469,12 @@ describe("K3 — updates while a bundle serves", () => {
     expect(
       state(
         receipt({
-          lastRun: { at: 3, outcome: "skipped", words: reason, by: "updater" },
+          lastRun: {
+            at: 3,
+            outcome: "skipped",
+            words: reason,
+            by: "agent-distro",
+          },
         }),
       ),
     ).toEqual({
@@ -1535,14 +1482,14 @@ describe("K3 — updates while a bundle serves", () => {
       title: `checked @3, skipped — agent-distro's updater: ${reason}`,
       tone: "muted",
     });
-    // padi's own words are labelled padi's, never the updater's.
+    // padi's own words are labelled padi's, never the delivery's.
     expect(
       state(
         receipt({
           lastRun: {
             at: 4,
             outcome: "failed",
-            words: "the updater exited 3 without a result: TypeError: boom",
+            words: "the delivered bundle is not in the store",
             by: "padi",
           },
         }),
@@ -1550,7 +1497,7 @@ describe("K3 — updates while a bundle serves", () => {
     ).toEqual({
       text: "ready · last update failed @4",
       title:
-        "last update failed @4 — padi: the updater exited 3 without a result: TypeError: boom",
+        "last update failed @4 — padi: the delivered bundle is not in the store",
       tone: "warn",
     });
     // Files that would not read say so on the line.
@@ -1563,58 +1510,46 @@ describe("K3 — updates while a bundle serves", () => {
     expect(
       state({
         ...receipt({
-          lastRun: { at: 1, outcome: "updated", words: "x", by: "updater" },
+          lastRun: { at: 1, outcome: "updated", words: "x", by: "delivery" },
         }),
         profile: "juspay",
       })?.text,
     ).toBe("ready");
   });
 
-  it("a machine's events are its own, in the updater's words, warn for a failure", () => {
-    expect(
-      agentHostDetail({
-        host: host(
-          ready,
-          receipt({
-            events: [
-              {
-                at: "2026-10-08T02:00:05Z",
-                profile: "vanilla",
-                kind: "updated",
-                words: "Claude Code 2.1.286 → 2.1.291",
-              },
-              {
-                at: "2026-10-08T02:00:09Z",
-                profile: "vanilla",
-                kind: "failed",
-                words: "nix build exit 1",
-              },
-            ],
-          }),
-        ),
-        setting: VANILLA_ON,
-        listing: LISTING,
-      })?.events,
-    ).toEqual([
-      {
-        when: `@${Date.parse("2026-10-08T02:00:05Z")}`,
-        kind: "updated",
-        text: "Claude Code 2.1.286 → 2.1.291",
-        title:
-          "updated — agent-distro's updater: Claude Code 2.1.286 → 2.1.291",
-        tone: "muted",
-      },
-      {
-        when: `@${Date.parse("2026-10-08T02:00:09Z")}`,
-        kind: "failed",
-        text: "nix build exit 1",
-        title: "failed — agent-distro's updater: nix build exit 1",
-        tone: "warn",
-      },
+  it("a mixed history log names each line's writer by what it says, never kolu's delivery", () => {
+    // One shared log: padi's `updated:` line for a delivery that landed, then
+    // agent-distro's own updater (its Home Manager module) failing and
+    // skipping. Only the updater writes `failed:`/`skipped:`; an `updated:`
+    // line may be either's, so it is the log's.
+    const log = [
+      "2026-10-08T02:00:05+00:00 vanilla updated: Claude Code 2.1.286 → 2.1.291",
+      "2026-10-08T02:00:09+00:00 vanilla failed: nix build exit 1",
+      "2026-10-08T08:00:03+00:00 vanilla skipped: cache https://cache.example not usable",
+    ].join("\n");
+    const events = recentEvents(log, "vanilla");
+    const detail = agentHostDetail({
+      host: host(ready, receipt({ events, lastRun: lastRunOf(events, null) })),
+      setting: VANILLA_ON,
+      listing: LISTING,
+    });
+    expect(detail?.state?.title).toBe(
+      `checked @${Date.parse("2026-10-08T08:00:03Z")}, skipped — agent-distro's updater: cache https://cache.example not usable`,
+    );
+    expect(detail?.events.map((e) => [e.title, e.tone])).toEqual([
+      [
+        "skipped — agent-distro's updater: cache https://cache.example not usable",
+        "muted",
+      ],
+      ["failed — agent-distro's updater: nix build exit 1", "warn"],
+      [
+        "updated — the host's update log: Claude Code 2.1.286 → 2.1.291",
+        "muted",
+      ],
     ]);
   });
 
-  it("the update toast quotes the updater and names the machine", () => {
+  it("the update toast quotes the history and names the machine", () => {
     // The machine by its name — the host tab's — never "this machine".
     expect(
       agentToast.updated("naiveintent", "Claude Code 2.1.286 → 2.1.291"),
@@ -1625,49 +1560,11 @@ describe("K3 — updates while a bundle serves", () => {
     });
   });
 
-  it("Check now: only a ready host with no run can check; any run is busy", () => {
-    expect(agentUpdateCheckable(ready)).toBe(true);
-    expect(agentUpdateCheckable(checking)).toBe(false);
-    expect(agentUpdateCheckable({ kind: "off" })).toBe(false);
-    expect(agentUpdateCheckable(undefined)).toBe(false);
-    // Any run on any host, for ANY profile — not only the selected one's.
-    expect(agentUpdateRunning([receipt({}), undefined])).toBe(false);
-    expect(
-      agentUpdateRunning([receipt({}), receipt({ running: ["juspay"] })]),
-    ).toBe(true);
-    // A disconnected host's last-known ready cannot answer.
-    expect(agentHostCheckable({ connected: true, status: ready })).toBe(true);
-    expect(agentHostCheckable({ connected: false, status: ready })).toBe(false);
-    expect(agentHostCheckable({ connected: true, status: checking })).toBe(
-      false,
-    );
+  it("Check now: the palette command's words", () => {
     // The fleet-wide check is a palette command now: its words, and the note
     // that says it asks every machine.
     expect(AGENTS_CHECK_NOW.label).toBe("Check for newer coding agents");
     expect(AGENTS_CHECK_NOW.note).toBe("every machine");
-  });
-
-  it("the words beside a filling mark's bar: a first download's headline, an update's line", () => {
-    expect(agentMarkFillWords(agentMarkOf(downloading, false), "box")).toBe(
-      AGENTS_UPDATE_DOWNLOADING,
-    );
-    const first = agentMarkOf(
-      {
-        kind: "downloading",
-        profile: "vanilla",
-        progress: { done: 1, total: 4 },
-      },
-      false,
-    );
-    expect(agentMarkFillWords(first, "box")).toBe(
-      agentMarkWords(first, "box")?.title,
-    );
-    expect(
-      agentMarkFillWords(agentMarkOf(ready, false), "box"),
-    ).toBeUndefined();
-    expect(
-      agentMarkFillWords(agentMarkOf(checking, false), "box"),
-    ).toBeUndefined();
   });
 
   it("the chips name this machine's versions once it has them", () => {

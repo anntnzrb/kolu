@@ -20,6 +20,9 @@ export {
 export {
   AgentSourceUnbakedError,
   type AgentResolutionContext,
+  type FlakeEvaluationOptions,
+  lockFlake,
+  resolveFlakeOutPath,
   readBakedAgentSource,
   resolveBakedAgentDrv,
   SURFACE_AGENT_FLAKE_REF_ENV,
@@ -75,8 +78,15 @@ export {
   type RemotePoolOptions,
 } from "./hostFanout";
 export {
+  type ClosureMiss,
+  type DeliverClosureOptions,
+  type DeliverClosureResult,
+  deliverClosure,
+  homeGcRoot,
   makeProvisionBudgets,
   makeStepBudget,
+  PROVISION_STEP_MAX_EXPIRIES,
+  PROVISION_STEP_SILENCE_BASE_MS,
   type ProvisionBudgets,
   type ProvisionOptions,
   type ProvisionResult,

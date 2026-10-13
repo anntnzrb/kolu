@@ -1,9 +1,10 @@
 /** The agents section of a machine's host details — everything about
  *  agent-distro that is TRUE OF THAT MACHINE: the profile new terminals there
- *  get and the build serving it, its state with its last update run, a failed
- *  download's own words and what it means there, that machine's last update
- *  events in the updater's words, and the one action it offers (check for
- *  newer agents, or retry the download). The facts and their words are
+ *  get and the build serving it, its state with its last delivery, a failed
+ *  delivery's own words and what it means there, that machine's last update
+ *  events,
+ *  and the one action it offers: check for newer agents — which is also how a
+ *  machine whose delivery failed is tried again. The facts and their words are
  *  `agentHostDetail`'s; Settings keeps only the fleet line.
  *
  *  Absent entirely when there are no agents to describe there — a padi built
@@ -13,44 +14,32 @@
 import AgentDistroLogo from "@kolu/agent-distro/solid";
 import {
   AGENTS_HOST_CHECK,
-  AGENTS_HOST_RETRY,
   type AgentHostDetail,
 } from "@kolu/agent-distro/status";
 import type { HostKey } from "kolu-common/hostKey";
 import { type Component, For, Show } from "solid-js";
 import {
-  agentHostCheckableNow,
   agentsWhere,
   checkAgentsOn,
   hostAgentDetail,
-  retryAgentsOn,
 } from "../agents/useAgentDistro";
+import { padiMap } from "../wire";
 
-/** The one action a machine's section offers, by the fold's verdict. */
-const ActionRow: Component<{ host: HostKey; action: "check" | "retry" }> = (
-  props,
-) => {
-  const words = () =>
-    props.action === "check" ? AGENTS_HOST_CHECK : AGENTS_HOST_RETRY;
-  // A check needs a machine that can answer one; a retry is always offered —
-  // the failure it retries IS the state the section is reporting.
-  const enabled = () =>
-    props.action === "retry" || agentHostCheckableNow(props.host);
+/** The one action a machine's section offers: check for newer agents. Shown
+ *  when the machine's agents allow one (`canCheck`); a disconnected machine's
+ *  last-known status cannot answer it. */
+const CheckRow: Component<{ host: HostKey }> = (props) => {
+  const enabled = () => padiMap.entry(props.host).state().kind === "connected";
   return (
     <button
       type="button"
       data-testid="host-agents-action"
-      data-action={props.action}
       disabled={!enabled()}
-      title={words().hint}
+      title={AGENTS_HOST_CHECK.hint}
       class="mt-0.5 flex w-full cursor-pointer items-center justify-between gap-4 rounded-md px-1.5 py-1 text-left text-[11px] text-fg-3 transition-colors hover:bg-surface-2 hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-fg-3"
-      onClick={() =>
-        props.action === "check"
-          ? checkAgentsOn(props.host)
-          : retryAgentsOn(props.host)
-      }
+      onClick={() => checkAgentsOn(props.host)}
     >
-      <span>{words().label}</span>
+      <span>{AGENTS_HOST_CHECK.label}</span>
       <span aria-hidden="true">↻</span>
     </button>
   );
@@ -113,16 +102,16 @@ const Section: Component<{ host: HostKey; detail: AgentHostDetail }> = (
     </div>
     {/* A failure's cause wraps in FULL — it may carry nix's own long line, and
         a cut-off cause is no cause. */}
-    <For each={props.detail.cause}>
-      {(line) => (
+    <Show when={props.detail.cause}>
+      {(cause) => (
         <p
           data-testid="host-agents-cause"
           class="my-0.5 font-mono text-[10px] leading-4 wrap-anywhere text-warning"
         >
-          {line}
+          {cause()}
         </p>
       )}
-    </For>
+    </Show>
     <Show when={props.detail.means}>
       {(means) => (
         <p class="mb-0.5 text-[10.5px] leading-4 text-fg-3">{means()}</p>
@@ -158,8 +147,8 @@ const Section: Component<{ host: HostKey; detail: AgentHostDetail }> = (
         </For>
       </div>
     </Show>
-    <Show when={props.detail.action}>
-      {(action) => <ActionRow host={props.host} action={action()} />}
+    <Show when={props.detail.canCheck}>
+      <CheckRow host={props.host} />
     </Show>
   </>
 );
