@@ -7,7 +7,7 @@
  *
  *  `writeTextToClipboard` fires synchronously at the top of the click handler,
  *  before `setCopied(true)`, so the clipboard write stays inside the
- *  user-activation gesture window (see clipboard.ts:28-34). */
+ *  user-activation gesture window (see `@kolu/solid-logtail`'s `clipboard.ts`). */
 
 import { toError } from "@kolu/surface/run-stream";
 import { Effect } from "effect";
@@ -20,7 +20,7 @@ import {
 } from "solid-js";
 import { toast } from "solid-sonner";
 import { runAction } from "../runAction";
-import { writeTextToClipboard } from "./clipboard";
+import { writeTextToClipboard } from "@kolu/solid-logtail";
 
 const CopyCommandButton: Component<{
   /** Command shown in the button (and copied, unless `copyText` overrides). */

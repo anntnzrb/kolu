@@ -24,10 +24,10 @@ import {
   createEffect,
   createMemo,
   createSignal,
-  For,
   Show,
 } from "solid-js";
 import { Portal } from "solid-js/web";
+import { toast } from "solid-sonner";
 import { hostMarks } from "../attention/attentionMarks";
 import CopyDiagnosticsButton from "../CopyDiagnosticsButton";
 import { ForwardRows } from "../forwards/ForwardRows";
@@ -40,11 +40,7 @@ import { runAction } from "../runAction";
 import { formatTimeAgo } from "../terminal/staleness";
 import { containingTileOf } from "../terminal/terminalTree";
 import { useTerminalStore } from "../terminal/useTerminalStore";
-import {
-  LOG_TAIL_LINE,
-  LOG_TAIL_SURFACE,
-  NO_LOG_LINES,
-} from "../ui/logTailChrome";
+import { LogTail, NO_LOG_LINES } from "@kolu/solid-logtail";
 import { surface } from "../ui/Surface";
 import { type AnchorSide, useAnchoredPopover } from "../ui/useAnchoredPopover";
 import { useServerIdentity } from "../useServerIdentity";
@@ -268,21 +264,27 @@ export const HostDiagnosticsPopover: Component<{
   // only ever renders for the active host), so the reason must not arrive here without its
   // evidence. It cannot: the two are one record on the failed arm.
   const failure = createMemo(() => failedEpisode(state()));
-  // A MEMO because both the `Show` guard and the `For` read it: called twice per render it
-  // folded the entry twice and handed `For` a fresh array each time, so the tail's rows tore
-  // down and rebuilt on every unrelated repaint (the same `Show`+`For` pairing ConnectCanvas
-  // already memoizes). TOTAL — a non-failed entry yields the shared {@link NO_LOG_LINES}, not
-  // `undefined`. Nothing here can tell the two apart (`length > 0` and `<For>` both read an
-  // empty array exactly as they read an absent one), and `failure()` already answers "is
-  // this entry failed", so an `| undefined` would be a distinction with no reader. That is
-  // NOT the canvas card's absence distinction, which IS observable and stays: this popover
-  // renders only the failure record's own `evidence`, which is never missing.
+  // A MEMO because both the `Show` guard and the tail block read it: computed twice per
+  // render it folded the entry twice and handed the block a fresh array each time, so the
+  // tail's rows tore down and rebuilt on every unrelated repaint (the same guard+memo
+  // pairing ConnectCanvas already uses). TOTAL — a non-failed entry yields the shared
+  // {@link NO_LOG_LINES}, not `undefined`. Nothing here can tell the two apart (`length > 0`
+  // and an empty list both read an empty array exactly as they read an absent one), and
+  // `failure()` already answers "is this entry failed", so an `| undefined` would be a
+  // distinction with no reader. That is NOT the canvas card's absence distinction, which IS
+  // observable and stays: this popover renders only the failure record's own `evidence`,
+  // which is never missing.
   const failureLog = createMemo(() => {
     const episode = failure();
     return episode === undefined
       ? NO_LOG_LINES
       : tailOf(episode.log, POPOVER_TAIL_LINES);
   });
+  // The whole log the frame carries, beside the four rows this popover shows: the Copy
+  // button hands a person everything the session retained for the attempt, not the
+  // window that fits here. (What the session retains is its own bound — `MAX_PROGRESS_LINES`
+  // in `surface-remote/src/session.ts` — so "retained" is the honest word.)
+  const failureWholeLog = createMemo(() => failure()?.log ?? NO_LOG_LINES);
 
   return (
     <Show when={props.open()}>
@@ -321,14 +323,15 @@ export const HostDiagnosticsPopover: Component<{
           </Show>
 
           <Show when={failureLog().length > 0}>
-            <div
-              data-testid="host-diagnostics-log"
-              class={`mt-1 max-h-20 overflow-y-auto px-1.5 py-1 text-[10px] leading-4 ${LOG_TAIL_SURFACE}`}
-            >
-              <For each={failureLog()}>
-                {(entry) => <div class={LOG_TAIL_LINE}>{entry.line}</div>}
-              </For>
-            </div>
+            <LogTail
+              testid="host-diagnostics-log"
+              lines={failureLog()}
+              log={failureWholeLog()}
+              class="mt-1 max-h-20 overflow-y-auto px-1.5 py-1 text-[10px] leading-4"
+              onCopyError={(message) =>
+                toast.error(`Failed to copy the log: ${message}`)
+              }
+            />
           </Show>
 
           {/* #1962 drop-in: when progress facts exist, render them here.

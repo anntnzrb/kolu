@@ -13,7 +13,7 @@
  *
  *  The overlay renders the live `log` tail + the elapsed timer off the frame's own DATA — a
  *  non-empty `log`, a `sinceMs` ≥ 1s — NOT a per-phase flag. So the `probing` window (the arch
- *  probe + the "is it already here?" check) narrates its real log ("<host>: checking for a
+ *  probe + the "is it already here?" check) narrates its real log ("checking for a
  *  cached agent…" → "…already provisioned — skipped copy") the instant it arrives, instead of
  *  a SILENT wait. The warm path still reads calm: a warm host short-circuits FAST, so `sinceMs`
  *  stays under the 1s elapsed threshold (no "0s" flash) and its tail is reassuring real output,
@@ -27,13 +27,14 @@
 
 import type { DaemonState } from "@kolu/padi-client/surface";
 import { encodeHostKey } from "kolu-common/hostKey";
-import { createMemo, Index, Show, untrack } from "solid-js";
+import { createMemo, Show, untrack } from "solid-js";
+import { toast } from "solid-sonner";
+import { LogTail, type LogLine, NO_LOG_LINES } from "@kolu/solid-logtail";
 import { showsElapsed, tailOf } from "../kaval/connectCanvasView";
 import { DAEMON_STATE_PRESENTATION } from "../kaval/daemonPresentation";
 import { getClockNow } from "../time/clock";
 import { formatElapsedShort } from "../time/duration";
 import DocLink from "../ui/DocLink";
-import { LOG_TAIL_SURFACE } from "../ui/logTailChrome";
 import { activeHost, connectionInfo } from "../wire";
 import {
   connectCanvasCopy,
@@ -129,11 +130,17 @@ export function ConnectCanvas(props: { daemonState: DaemonState | undefined }) {
     return a === null ? null : a.ms + (clockNow() - a.at);
   };
 
-  const tail = createMemo(() => {
+  // This episode's log as the wire holds it — the WHOLE retained log, which the
+  // 6-line tail below is a window onto and the Copy button writes. Read from the
+  // frame's own data (a non-empty log narrates; no per-phase flag), and typed as
+  // the structural line so the tail/copy consumers carry no wire `source`.
+  const log = createMemo<readonly LogLine[]>(() => {
     const frame = info();
-    if (frame === undefined || !isNarratedPhase(frame.phase)) return [];
-    return tailOf(frame.log);
+    return frame === undefined || !isNarratedPhase(frame.phase)
+      ? NO_LOG_LINES
+      : frame.log;
   });
+  const tail = createMemo(() => tailOf(log()));
 
   return (
     <Show
@@ -171,24 +178,31 @@ export function ConnectCanvas(props: { daemonState: DaemonState | undefined }) {
               </span>
             </Show>
           </div>
+          {/* The live log tail renders whenever the frame carries log lines — the `probing`
+              window's "checking for a cached agent…" narrates the instant it arrives, no
+              silent wait. Data presence, not a per-phase flag.
+              Six line-heights tall (`6lh`: the CSS unit, so the browser does the
+              arithmetic) with the newest line pinned to the bottom. The height must be
+              FIXED, or the block grows a row at a time and the title and elapsed timer
+              above it slide on every new line — and it must be tied to the text scale,
+              which is why it is a line-height multiple rather than the hand-computed
+              pixel figure it used to be: change the scale and the box follows. */}
+          <Show when={tail().length > 0}>
+            <div class="w-full max-w-2xl">
+              <LogTail
+                testid="connect-tail"
+                lines={tail()}
+                log={log()}
+                class="h-[6lh] flex flex-col justify-end overflow-hidden px-3 py-2 text-[11px] leading-relaxed"
+                onCopyError={(message) =>
+                  toast.error(`Failed to copy the log: ${message}`)
+                }
+              />
+            </div>
+          </Show>
           <div class="text-xs">
             <DocLink slug="remote-hosts">Add another machine →</DocLink>
           </div>
-          {/* The live log tail renders whenever the frame carries log lines — the `probing`
-              window's "checking for a cached agent…" narrates the instant it arrives, no
-              silent wait. Data presence, not a per-phase flag. */}
-          <Show when={tail().length > 0}>
-            <div
-              data-testid="connect-tail"
-              class={`w-full max-w-2xl overflow-hidden px-3 py-2 text-[11px] leading-relaxed ${LOG_TAIL_SURFACE}`}
-            >
-              <Index each={tail()}>
-                {(entry) => (
-                  <div class="truncate whitespace-pre">{entry().line}</div>
-                )}
-              </Index>
-            </div>
-          </Show>
         </div>
       )}
     </Show>
