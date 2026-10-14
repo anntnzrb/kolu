@@ -143,6 +143,44 @@ export class SurfaceRelayTransportLost extends Schema.TaggedError<SurfaceRelayTr
   }
 }
 
+/** The upstream ANSWERED and this build will not speak to it — a contract skew,
+ *  a socket owned by a stranger. The STANDING counterpart of
+ *  {@link SurfaceRelayTransportLost}: that one is a drop the parent will heal,
+ *  this one is a condition a retry cannot change, so the fence must not retry it
+ *  and a subscriber must be TOLD rather than held.
+ *
+ *  It is the difference between "no daemon here" and "a daemon this build cannot
+ *  read" reaching a reader at all: a relay that held on a refusal would draw the
+ *  same blank an absent upstream draws, and the install that needs looking at
+ *  would look exactly like the machine that never had one. Carries the refusal's
+ *  own sentence, because the far end's version skew is the only thing that can
+ *  say what is wrong.
+ *
+ *  RAISED AS A DEFECT, and so NOT in {@link SurfaceErrorSchema}. The union
+ *  above is what a relay hop DECODES and re-encodes on a DECLARED error
+ *  channel, and a stream minted by `defineSurface` has none (D4 declares errors
+ *  per PROCEDURE; `Rpc.make({stream: true})` resolves an undeclared channel to
+ *  `Schema.Never`) — so a typed failure on one is encoded against that `Never`
+ *  and arrives as a complaint about the encoding instead of the sentence this
+ *  class exists to carry. A defect crosses with its message intact and is never
+ *  retried, both of which are what a standing refusal wants.
+ *
+ *  A map-FOLDED stream DOES declare a channel (`@kolu/surface-map`'s
+ *  `foldedError`), which is why the transport deaths above cross a map hop by
+ *  `_tag` — so this is a gap in `defineSurface`'s own streams, not a law about
+ *  streams. Giving them the framework union is the standing proposal
+ *  (juspay/kolu#2297); until then the die is the honest local move, and
+ *  the class stays a schema class so an in-process consumer narrows on it
+ *  (`isSurfaceUpstreamRefused`) and a member with a declared channel can name
+ *  it. */
+export class SurfaceUpstreamRefused extends Schema.TaggedError<SurfaceUpstreamRefused>(
+  "@kolu/surface/SurfaceUpstreamRefused",
+)("SurfaceUpstreamRefused", { reason: Schema.String }) {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
 // ── Keyed-map rejections (`@kolu/surface-map`) ─────────────────────────
 //
 // Declared HERE rather than in `@kolu/surface-map` for the relay-rehydration
@@ -196,11 +234,13 @@ export class MapEntryFailed extends Schema.TaggedError<MapEntryFailed>(
 
 // ── The closed union ───────────────────────────────────────────────────
 
-/** Every error the FRAMEWORK itself can put on the wire, as one schema. A relay hop
- *  decodes against this union and re-encodes the decoded value, which is what keeps
- *  a `_tag` (and its data) intact across serialize → deserialize → re-serialize.
- *  App-declared procedure errors are NOT in here — they are declared per procedure
- *  on `ProcedureSpec.error` and travel on that procedure's own error channel. */
+/** Every error the FRAMEWORK itself can put on a DECLARED error channel, as one
+ *  schema. A relay hop decodes against this union and re-encodes the decoded
+ *  value, which is what keeps a `_tag` (and its data) intact across serialize →
+ *  deserialize → re-serialize. App-declared procedure errors are NOT in here —
+ *  they are declared per procedure on `ProcedureSpec.error` and travel on that
+ *  procedure's own error channel; {@link SurfaceUpstreamRefused} is not either,
+ *  because it is raised as a DEFECT (see its own note). */
 export const SurfaceErrorSchema = Schema.Union([
   SurfaceTransportRetired,
   SurfaceStdioTransportClosed,
@@ -277,6 +317,15 @@ export function isSurfaceRelayTransportLost(
   error: unknown,
 ): error is SurfaceRelayTransportLost {
   return error instanceof SurfaceRelayTransportLost;
+}
+
+/** Is `error` the STANDING refusal — the upstream answered and this build cannot
+ *  speak to it? A face that draws a reason reads it off `reason`; the retry fence
+ *  never retries it, because nothing a retry does can unmake a version skew. */
+export function isSurfaceUpstreamRefused(
+  error: unknown,
+): error is SurfaceUpstreamRefused {
+  return error instanceof SurfaceUpstreamRefused;
 }
 
 // ── What an ARBITRARY failure says ───────────────────────────────────────

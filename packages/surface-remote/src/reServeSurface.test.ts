@@ -17,6 +17,10 @@
 
 import { buildSurfaceFace } from "@kolu/surface/client";
 import { defineSurface } from "@kolu/surface/define";
+import {
+  isSurfaceUpstreamRefused,
+  type SurfaceUpstreamRefused,
+} from "@kolu/surface/errors";
 import { directDispatch } from "@kolu/surface/links/direct";
 import { Cause, Effect, Exit, Schema, Stream } from "effect";
 import { describe, expect, it } from "vitest";
@@ -368,6 +372,7 @@ function makeSession() {
   const listeners = new Set<(s: SessionState<SshProv>) => void>();
   let destroyed = false;
   let clientPromise: Promise<AgentClient> | null = null;
+  let refusal: string | null = null;
   let state: SessionState<SshProv> = {
     phase: "provisioning",
     log: [],
@@ -381,6 +386,10 @@ function makeSession() {
   const session = {
     pin: () => {
       pins += 1;
+      // A pin that finds no link DIALS, and a dial re-asks the admit question —
+      // so the last verdict's refusal stops being this session's answer the
+      // moment the pin is taken, synchronously, exactly as `makeSession` does.
+      if (pins === 1) refusal = null;
       return clientPromise ?? Promise.reject(new Error("no client yet"));
     },
     release: () => {
@@ -392,6 +401,7 @@ function makeSession() {
     isDestroyed: () => destroyed,
     currentClient: () => (destroyed ? null : clientPromise),
     currentState: () => state,
+    refusal: () => refusal,
     onState: (cb: (s: SessionState<SshProv>) => void) => {
       listeners.add(cb);
       cb(state); // snapshot on subscribe, like the real inMemoryCell-backed onState
@@ -411,6 +421,8 @@ function makeSession() {
       fire();
     },
     setClient: (c: AgentClient) => {
+      // A fresh dial re-asks the admit question, exactly as `makeSession` does.
+      refusal = null;
       clientPromise = Promise.resolve(c);
       fire();
     },
@@ -433,6 +445,22 @@ function makeSession() {
       state = {
         phase: "absent",
         error: "nothing is serving there",
+        log: [],
+        sinceMs: 0,
+        campaignEpoch: 0,
+      };
+      fire();
+    },
+    /** Something IS serving and this build will not speak to it — the admit
+     *  verdict's standing refusal, published the way `makeSession` publishes
+     *  it: a down frame, plus the sentence on `refusal()`. */
+    setRefused: (reason: string) => {
+      clientPromise = null;
+      refusal = reason;
+      state = {
+        phase: "disconnected",
+        error: reason,
+        cause: "remote",
         log: [],
         sinceMs: 0,
         campaignEpoch: 0,
@@ -1072,6 +1100,83 @@ describe("reServeSurface — demand, and an upstream that is not there", () => {
 
     sub.stop();
     await teardown(session, served.done, upstream2);
+  });
+
+  it("FAILS a subscriber when the upstream refuses, rather than drawing a blank", async () => {
+    const { session, served, downstream } = cold();
+    const upstream = makeUpstream(1);
+    session.setClient(upstream.client);
+    session.markConnected();
+
+    const sub = drain(downstream.surface.pulses.get({ repo: "r" }));
+    const pulses = await upstreamStream(upstream.pulseStreams, "r");
+    pulses.push(7);
+    await sub.waitFrames(1);
+
+    // The daemon is replaced by one this build cannot read. That is NOT the
+    // absence above: something answered. Holding would paint 7 forever and the
+    // absent frame would say "nothing is there", which is a lie — so the
+    // subscription FAILS, carrying the refusal's own sentence.
+    upstream.kill();
+    session.setRefused("speaks contract 9.0; this build reads 1.5");
+    await sub.waitSettled();
+    expect(isSurfaceUpstreamRefused(sub.error)).toBe(true);
+    expect((sub.error as SurfaceUpstreamRefused).reason).toContain(
+      "this build reads 1.5",
+    );
+    // The last live frame is all it ever painted — no absent frame pretending
+    // the machine has no daemon.
+    expect(sub.frames).toEqual([7]);
+
+    session.destroy();
+    await served.done;
+  });
+
+  it("refuses a subscriber that arrives while the refusal is standing", async () => {
+    const { session, served, downstream } = cold();
+    const upstream = makeUpstream(1);
+    session.setClient(upstream.client);
+    session.markConnected();
+    // A first subscriber holds the demand, so the daemon this build cannot read
+    // is the CURRENT answer — not a verdict a fresh dial is about to replace.
+    const holder = drain(downstream.surface.pulses.get({ repo: "held" }));
+    await waitUntil(() => session.pins() === 1, "the first subscriber to pin");
+    session.setRefused("the daemon speaks a contract this build cannot read");
+
+    const sub = drain(downstream.surface.pulses.get({ repo: "r" }));
+    await sub.waitSettled();
+    expect(isSurfaceUpstreamRefused(sub.error)).toBe(true);
+    expect(sub.frames).toEqual([]);
+
+    holder.stop();
+    sub.stop();
+    await teardown(session, served.done, upstream);
+  });
+
+  it("does NOT refuse the subscriber whose own pin re-dials", async () => {
+    const { session, served, downstream } = cold();
+    // Nothing is subscribed, so the link was let go while a refusal stood. The
+    // next subscriber's own pin re-dials — and a verdict the dial in flight is
+    // about to replace must not be read back to it. (A refusal is terminal for
+    // a subscription: told it once, this reader would need two re-keys and a
+    // stale sentence to learn the daemon was upgraded.)
+    session.setRefused("the daemon speaks a contract this build cannot read");
+    expect(session.pins()).toBe(0);
+
+    const sub = drain(downstream.surface.pulses.get({ repo: "r" }));
+    await waitUntil(() => session.pins() === 1, "the subscription to pin");
+    // The dial lands on a daemon this build CAN read.
+    const upstream = makeUpstream(1);
+    session.setClient(upstream.client);
+    session.markConnected();
+    const pulses = await upstreamStream(upstream.pulseStreams, "r");
+    pulses.push(7);
+    await sub.waitFrames(1);
+    expect(sub.frames).toEqual([7]);
+    expect(sub.error).toBeNull();
+
+    sub.stop();
+    await teardown(session, served.done, upstream);
   });
 
   it("refuses an absent frame for a member that could never send one", () => {
