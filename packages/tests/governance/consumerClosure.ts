@@ -34,6 +34,8 @@ import { readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import {
   declaredDependencyClosure,
+  declaredRuntimeEdges,
+  workspacePackageExtensions,
   workspacePackageRoots,
 } from "@kolu/daemon-test-gate/runtimeDepEdges";
 import { nixEvalJson, nixpkgsPreamble } from "./nixEval";
@@ -206,16 +208,15 @@ export function emitConsumerClosure(repoRoot: string): ConsumerClosure {
     });
   }
   const names = new Set(parsed.map((m) => m.name));
+  const extensions = workspacePackageExtensions(repoRoot);
 
   const members: Record<string, ClosureMember> = {};
   for (const { name, rel, manifest } of parsed) {
-    // The SAME edge rule `declaredDependencyClosure` walks — `dependencies` +
-    // `peerDependencies`, never devDependencies, because a hydrating consumer
-    // installs a copied directory's declared RUNTIME edges. Spelled here rather
-    // than imported only because that helper answers a closure, not an
-    // adjacency; the rule itself must stay the same one, which is why it is
-    // named rather than paraphrased.
-    const declared = { ...manifest.dependencies, ...manifest.peerDependencies };
+    // The SAME edge rule the closure walk uses, from the same reader:
+    // `dependencies` + `peerDependencies` (never devDependencies, because a
+    // hydrating consumer installs a copied directory's declared RUNTIME edges)
+    // plus this workspace's `packageExtensions` for the member.
+    const declared = declaredRuntimeEdges(manifest, extensions.get(name));
     const workspace: string[] = [];
     const external: Record<string, string> = {};
     for (const dep of Object.keys(declared).sort()) {

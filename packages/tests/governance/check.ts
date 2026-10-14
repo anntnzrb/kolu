@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { graftedMembers } from "@kolu/daemon-test-gate/runtimeDepEdges";
 // Effect's own YAML parser rather than the `yaml` package — see the note on the
 // same import in `effectPin.ts`. The input here (coverage-ledger.yaml) is
 // machine-generated too, and both parsers were checked deep-equal over it.
@@ -242,6 +243,12 @@ const effectPins = collectEffectPins(repoRoot);
 const effectVersion = validateEffectPins(
   effectPins,
   vendoredManifests(repoRoot),
+  // The grafted manifests, from the same artifact the consumer recipe is checked
+  // against — a manifest kolu does not own owes a literal, but must not be told
+  // to edit itself into one. One reader of that artifact: `graftedMembers`.
+  new Set(
+    [...graftedMembers(repoRoot).values()].map((dir) => `${dir}/package.json`),
+  ),
 );
 const betaAssumptions = collectBetaAssumptions(repoRoot);
 const effectVersionRefs = collectEffectVersionRefs(repoRoot);

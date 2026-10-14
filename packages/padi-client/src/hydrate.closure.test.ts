@@ -105,11 +105,29 @@ const DECLARED_ALLOWED = new Set([
   "@kolu/byte-units",
   "@kolu/padi-client",
   "@kolu/surface",
+  // The grafted `@odu/service-client`'s dial reaches it, so a consumer copying
+  // that directory copies this one too (its `packageExtensions` edge) — and with
+  // it the two that `@kolu/surface-app` itself drags in: the browser/CLI socket
+  // stack and the URL/spelling leaf it hands around.
+  "@kolu/surface-app",
+  "@kolu/url-shape",
   "@kolu/surface-daemon",
   "@kolu/surface-daemon-supervisor",
   "@kolu/terminal-vocab",
   "@kolu/log",
   "@kolu/shell-quote",
+  // odu's own service contract — the board row and node schemas the `ciStatus`
+  // frame carries verbatim (kolu reads odu's shapes rather than re-declaring
+  // them; see the package's README). GRAFTED from the npins `odu` pin into
+  // `odu/*`, never committed, and one pin's closure rather than one package:
+  // `service-client` re-publishes the durable record shapes from `run-history`,
+  // which reaches the node-status vocabulary of `run-client`. Their manifests
+  // declare `effect` alone (in odu the `@kolu/*` sources are hydrated from a
+  // pin), so a hydrating consumer copies three directories and installs one
+  // package it already has.
+  "@odu/run-client",
+  "@odu/run-history",
+  "@odu/service-client",
   "anyagent",
   "anyforge",
   "kolu-agents",
@@ -187,6 +205,11 @@ const IMPORTED_ALLOWED = new Set([
   "@kolu/surface-daemon",
   "@kolu/surface-daemon-supervisor",
   "@kolu/terminal-vocab",
+  // Reached through the grafted odu trio's `surface` modules (kolu imports
+  // their schemas; see DECLARED_ALLOWED).
+  "@odu/run-client",
+  "@odu/run-history",
+  "@odu/service-client",
   "anyagent",
   "anyforge",
   "kolu-agents",
@@ -248,6 +271,13 @@ const HYDRATE_CLOSURE = declaredDependencyClosure({
  * whole `@xterm/*` suite among them, plus `@resvg/resvg-wasm`, `pino`(+roll,
  * +pretty), `conf`, `marked`, `columnify` and six more `@solid-primitives/*`.
  *
+ * The list grows by ONE member's consequence since the odu graft: the grafted
+ * `@odu/service-client`'s dial reaches `@kolu/surface-app` (declared for it in
+ * `pnpm-workspace.yaml`'s `packageExtensions`, because a grafted manifest cannot
+ * name the `@kolu/*` packages its source imports), and that package's own
+ * closure is `solid-js`, two `@solid-primitives/*` and `ws` — all but `ws`
+ * already here.
+ *
  * What is left, and where the remaining fat comes from — say it plainly rather
  * than let a reader assume this list is irreducible:
  *
@@ -280,6 +310,11 @@ const EXPECTED_EXTERNALS = [
   "solid-js",
   "string-argv",
   "ts-pattern",
+  // `@kolu/surface-app`'s socket dependency, which arrived with the odu graft's
+  // `packageExtensions` edge: a browser or CLI dialling the framework's
+  // websocket route needs it, and nothing in this package's own import graph
+  // did before.
+  "ws",
 ];
 
 describe("@kolu/padi-client hydrates without the daemon", () => {

@@ -38,6 +38,7 @@
     "@kolu/surface-daemon-supervisor": "workspace:*",
     "@kolu/surface-remote": "workspace:*",
     "@kolu/terminal-vocab": "workspace:*",
+    "@odu/service-client": "workspace:*",
     "anyagent": "workspace:*",
     "anyforge": "workspace:*",
     "columnify": "^1.6.0",

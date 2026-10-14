@@ -69,6 +69,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { parse } from "@babel/parser";
+import { Yaml } from "effect/encoding";
 
 // ── Workspace discovery (pnpm-workspace.yaml is the one source of truth) ──────
 
@@ -134,6 +135,83 @@ export function workspacePackageRoots(repoRoot: string): string[] {
     }
   }
   return [...roots];
+}
+
+/**
+ * The `packageExtensions` edges this pnpm workspace declares: `member → dep →
+ * spec`.
+ *
+ * WHY A MANIFEST WALK NEEDS THEM. A GRAFTED member's manifest is authored in the
+ * UPSTREAM workspace, where the `@kolu/*` sources it imports are hydrated from a
+ * pin rather than declared — naming one there would send its package manager to
+ * a registry for a package that is not published. In THIS workspace the edge is
+ * real and IS declared, in `pnpm-workspace.yaml`'s `packageExtensions` (pnpm's own
+ * way to say "this member also depends on that one"), and pnpm links kolu's
+ * workspace copy in because of it. A walk that read manifests alone would
+ * therefore miss an edge a hydrating consumer has to copy, and an import walk
+ * would report it undeclared.
+ *
+ * Parsed with Effect's YAML — the same choice `packages/tests/governance/
+ * effectPin.ts` makes for this same file, and for the same reason: the input is
+ * machine-generated, and this repo already depends on Effect here. */
+export function workspacePackageExtensions(
+  repoRoot: string,
+): Map<string, Record<string, string>> {
+  const raw = readFileSync(join(repoRoot, "pnpm-workspace.yaml"), "utf8");
+  const parsed = Yaml.parse(raw) as {
+    packageExtensions?: Record<string, Record<string, unknown>>;
+  };
+  const out = new Map<string, Record<string, string>>();
+  for (const [member, extension] of Object.entries(
+    parsed.packageExtensions ?? {},
+  )) {
+    const deps: Record<string, string> = {};
+    for (const section of ["dependencies", "optionalDependencies"]) {
+      const entries = extension[section];
+      if (entries === undefined || typeof entries !== "object") continue;
+      for (const [dep, spec] of Object.entries(
+        entries as Record<string, unknown>,
+      )) {
+        if (typeof spec === "string") deps[dep] = spec;
+      }
+    }
+    if (Object.keys(deps).length > 0) out.set(member, deps);
+  }
+  return out;
+}
+
+/**
+ * The GRAFTED members — the packages kolu does not own: it copies their bytes out
+ * of an npins pin (`osfacts-client` from `osfacts`, the `@odu/*` trio from `odu`)
+ * and gitignores them. Package name → its REPO-RELATIVE directory, exactly as the
+ * artifact spells it (`odu/service-client`), so a caller that wants an absolute
+ * path joins `repoRoot` itself and a caller that wants a manifest path appends.
+ *
+ * READ FROM THE EMITTED ARTIFACT, not re-derived from how the workspace file
+ * happens to spell a member. `nix/consumer-closure.json` is where `consumer.nix`
+ * and the emitter already agree about which members are pins and which revision
+ * each came from — a fact Nix derives from its own `pinnedPins` — and a walk that
+ * inferred "grafted" from "the entry is a path rather than a glob" would be a
+ * second reading of the same fact, one workspace-file edit away from disagreeing
+ * with the pin it names. A repo with no artifact (an external consumer walking
+ * its own tree) simply has no grafted members.
+ */
+export function graftedMembers(repoRoot: string): Map<string, string> {
+  const names = new Map<string, string>();
+  let parsed: { members?: Record<string, { dir?: string; pin?: unknown }> };
+  try {
+    parsed = JSON.parse(
+      readFileSync(join(repoRoot, "nix", "consumer-closure.json"), "utf8"),
+    ) as typeof parsed;
+  } catch {
+    return names;
+  }
+  for (const [name, member] of Object.entries(parsed.members ?? {})) {
+    if (member.pin !== undefined && member.dir !== undefined) {
+      names.set(name, member.dir);
+    }
+  }
+  return names;
 }
 
 /** Every workspace member's manifest, cached by package DIRECTORY. One parse per
@@ -271,7 +349,7 @@ function importsOf(file: string, includeTypeOnly: boolean): string[] {
 
 // ── Manifest + resolution machinery ───────────────────────────────────────────
 
-type Manifest = {
+export type Manifest = {
   name?: string;
   main?: string;
   exports?: Record<string, unknown>;
@@ -400,6 +478,13 @@ export function walkRuntimeDepEdges(opts: {
   } = opts;
 
   const members = membersByName(repoRoot);
+  // A member's declared runtime edges: its own manifest, PLUS what this workspace
+  // declares for it in `packageExtensions` (see that reader — a grafted member's
+  // manifest cannot name the `@kolu/*` packages it imports).
+  const extensions = workspacePackageExtensions(repoRoot);
+  const declaredEdge = (owner: Manifest, pkgName: string): string | undefined =>
+    extensions.get(owner.name ?? "")?.[pkgName] ??
+    owner.dependencies?.[pkgName];
   // Only workspace-discovered names owe the `workspace:` protocol; a pin is
   // spelled however the consumer's manifest spells pins, so the two membership
   // kinds are indexed together for walking but kept apart for that one rule.
@@ -452,7 +537,7 @@ export function walkRuntimeDepEdges(opts: {
       const memberDir = members.get(pkgName);
       if (pkgName !== ownerName) {
         crossed.add(spec);
-        const declared = owner.dependencies?.[pkgName];
+        const declared = declaredEdge(owner, pkgName);
         if (declared === undefined) {
           violations.push({
             file: relative(repoRoot, file),
@@ -503,6 +588,30 @@ export function walkRuntimeDepEdges(opts: {
 
 // ── The DECLARED closure (the TS mirror of nix's `depClosure`) ────────────────
 
+/** A member's DECLARED runtime edges: `dependencies` + `peerDependencies`
+ *  (never `devDependencies` — they never ship, and a hydrating consumer that
+ *  copies a directory installs only what it declares at runtime), plus what this
+ *  workspace declares for the member in `packageExtensions` — an edge a GRAFTED
+ *  member's manifest cannot spell, because the `@kolu/*` packages its source
+ *  imports do not exist in the repo it is authored in (see
+ *  {@link workspacePackageExtensions}). Spec string per package name, later
+ *  spreads winning, which is what makes the extension an override.
+ *
+ *  One spelling: the closure walk below and the consumer-closure emitter
+ *  (`packages/tests/governance/consumerClosure.ts`) both ask this question, and
+ *  an adjacency that disagreed with the closure built on it is a gate grading
+ *  itself against the wrong graph. */
+export function declaredRuntimeEdges(
+  manifest: Manifest,
+  extension: Record<string, string> | undefined,
+): Record<string, string> {
+  return {
+    ...manifest.dependencies,
+    ...manifest.peerDependencies,
+    ...extension,
+  };
+}
+
 /**
  * The transitive RUNTIME-dependency closure of `entries` over workspace members —
  * what a consumer that VENDORS a package directory actually has to copy, whose
@@ -548,6 +657,7 @@ export function declaredDependencyClosure(opts: {
   const { repoRoot, entries } = opts;
 
   const dirOf = membersByName(repoRoot);
+  const extensions = workspacePackageExtensions(repoRoot);
 
   // name → dir for every member REACHED, so the manifest paths below come out of
   // the walk itself rather than a second lookup that has to assert its own hits.
@@ -564,11 +674,9 @@ export function declaredDependencyClosure(opts: {
       );
     }
     reached.set(name, dir);
-    const manifest = manifestOf(dir);
-    for (const dep of Object.keys({
-      ...manifest.dependencies,
-      ...manifest.peerDependencies,
-    })) {
+    for (const dep of Object.keys(
+      declaredRuntimeEdges(manifestOf(dir), extensions.get(name)),
+    )) {
       if (dirOf.has(dep)) stack.push(dep);
       else outside.add(dep);
     }

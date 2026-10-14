@@ -32,6 +32,7 @@
     "@kolu/surface-daemon": "workspace:*",
     "@kolu/surface-daemon-supervisor": "workspace:*",
     "@kolu/terminal-vocab": "workspace:*",
+    "@odu/service-client": "workspace:*",
     "anyagent": "workspace:*",
     "anyforge": "workspace:*",
     "effect": "4.0.0",

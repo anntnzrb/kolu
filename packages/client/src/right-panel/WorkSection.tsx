@@ -12,19 +12,35 @@
  *  `useTerminalStore`). */
 
 import { activeArm, type TerminalMetadata } from "@kolu/padi-client/surface";
+import type { CiStatusFrame } from "@kolu/padi-client/surface";
 import { terminalKey } from "@kolu/terminal-vocab/terminalKey";
+import { agoPhrase, compactPhrase } from "@kolu/terminal-vocab/duration";
+import { shortSha } from "@odu/run-client/nodeId";
+import { logHash, runHash } from "@odu/service-client/routes";
+import {
+  runStatus,
+  scopeSuffix,
+  type StatusHue,
+} from "@odu/service-client/board";
+import {
+  STATUS_META,
+  type RunNode,
+  type RunRow,
+} from "@odu/service-client/surface";
 import { type CheckStatus, type PrInfo, prValue } from "anyforge/schemas";
 import { prUnavailableSource } from "kolu-common/surface";
-import { type Component, createMemo, For, Show } from "solid-js";
+import { type Component, createMemo, For, type JSX, Show } from "solid-js";
 import { ChecksIndicator, PrStateIcon } from "@kolu/solid-dockrow";
 import { ProviderUnavailableContent } from "../terminal/PrUnavailablePopover";
 import { assignColors } from "../terminal/terminalDisplay";
+import { getClockNow } from "../time/clock";
 import Chip from "../ui/Chip";
 import Disclosure from "../ui/Disclosure";
 import { WorktreeIcon } from "../ui/Icons";
 import RepoMonogram from "../ui/RepoMonogram";
 import Row from "../ui/Row";
 import Section from "../ui/Section";
+import type { OduLinkAct, OduLinkOutlet } from "./useOduLink";
 
 /** Triage order — the sequence a reader wants: what's broken, what's still
  *  moving, what's done. ONE ordered list serves both the check list's sort and
@@ -71,6 +87,16 @@ const ciRollup = (
   };
 };
 
+/** A lane's triage class — what's broken, what's still moving, what's done.
+ *  odu's own columns decide it (`isRed`, `progress`), so this file states an
+ *  ORDER over lanes, not a second assignment of meaning to a status; the lanes
+ *  arrive in the run's own schedule and are sorted here because the order a
+ *  reader wants is this face's. */
+const laneRank = (lane: RunNode): number => {
+  const meta = STATUS_META[lane.status];
+  return meta.isRed ? 0 : meta.progress === "running" ? 1 : 2;
+};
+
 /** The disclosure's summary line — "1 failed · 2 running · 6 passed", the
  *  non-empty buckets in triage order. No verdict branching: the order carries
  *  it, and the chip above already states it. */
@@ -78,6 +104,185 @@ const checksSummary = (counts: Record<CheckStatus, number>): string =>
   TRIAGE.filter((o) => counts[o] > 0)
     .map((o) => `${counts[o]} ${OUTCOME[o].word}`)
     .join(" · ");
+
+/** Where a LANE lives in odu web: its own attempt's log, or — for a lane that
+ *  never started — the run page.
+ *
+ *  odu names "no attempt yet" as an EMPTY log key (`RunNode.logKey`: a node on
+ *  the roster with no attempt carries `""` rather than a fabricated attempt 1,
+ *  "which would name evidence that does not exist"), so that is the fact read
+ *  here. A lane with no log has no log page to open; the run page is where it is
+ *  read, which is also what odu's own router does with an address naming no
+ *  attempt. */
+const laneHash = (
+  run: Pick<RunRow, "runId">,
+  lane: Pick<RunNode, "logKey">,
+): string => (lane.logKey === "" ? runHash(run.runId) : logHash(lane.logKey));
+
+/** odu's own site — the heading that introduces the readout names the tool and
+ *  points at it, because a reader who has never heard of odu cannot tell what a
+ *  lane list is made of. */
+const ODU_URL = "https://juspay.github.io/odu/";
+
+/** How kolu paints a hue odu assigned — the ONE place the two palettes meet,
+ *  one row per hue rather than one table per attribute. odu assigns MEANING to
+ *  a hue (`BOARD_STATE` / `OUTCOME`, read through its own `runStatus`); kolu
+ *  assigns the chip tone, the glyph and the text colour, and nothing here
+ *  re-reads a run's state. Row-per-hue is also what keeps a sixth hue from
+ *  landing in one of three lists and not the others — the shape `OUTCOME` above
+ *  already keeps for check outcomes.
+ *
+ *  `violet` is odu's "the owner is gone": a failure to a reader, and kolu's
+ *  `Chip` has no violet, so it wears `danger` there and `alert` in text. */
+const ODU_HUE: Record<
+  StatusHue,
+  { tone: "neutral" | "ok" | "warning" | "danger"; glyph: string; text: string }
+> = {
+  grey: { tone: "neutral", glyph: "○", text: "text-fg-3" },
+  amber: { tone: "warning", glyph: "●", text: "text-warning" },
+  green: { tone: "ok", glyph: "✓", text: "text-ok" },
+  red: { tone: "danger", glyph: "✕", text: "text-danger" },
+  violet: { tone: "danger", glyph: "⚠", text: "text-alert" },
+};
+
+/** `<sha7>#<seq>` — the ref every odu face prints — plus odu's `+dirty` marker
+ *  when the run tested a working tree that merely claimed that commit. `shortSha`
+ *  is odu's own; the 7 is its rule, not this file's. */
+const oduRef = (run: RunRow): string => {
+  const short = shortSha(run.sha);
+  const ref = run.seq === null ? short : `${short}#${run.seq}`;
+  return run.dirty ? `${ref}+dirty` : ref;
+};
+
+/** The tiny label a disclosure's parts wear — the `Section` header's own type,
+ *  one tier down, because these labels are inside a disclosure and not heads of
+ *  a section. */
+const SUBHEAD =
+  "pt-1.5 pb-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-fg-3/60";
+
+/** The lane row's layout — shared by the arms that can be clicked and the one
+ *  that cannot, so a row is one row whichever element it turns out to be.
+ *  `group/lane` is the hover the ID underlines through, which is an affordance
+ *  only the clickable arms get. */
+const ROW = "flex min-w-0 items-center gap-1.5";
+/** …and a chip's own chrome, and a lane row's layout minus the glyph. */
+const CHIP_ROW = "inline-flex";
+const RECENT_ROW = "flex min-w-0 items-baseline gap-1.5";
+const ODU_TITLE = "open in odu";
+
+/** One lane: its own facts, and the way out to that attempt's log in odu web.
+ *
+ *  Long output is READ in odu's own page (searchable, coloured, followed live),
+ *  so a lane's row is the link to it — the whole row, because every fact on it is
+ *  about one attempt. */
+const LaneRow: Component<{
+  lane: RunNode;
+  /** The lane's own facts, wrapped by the caller's `OduLink`. */
+  children?: JSX.Element;
+}> = (props) => {
+  const status = () => STATUS_META[props.lane.status];
+  const hue = () => ODU_HUE[status().hue].text;
+  return (
+    <>
+      <span
+        class={`w-3 shrink-0 text-center ${hue()}`}
+        title={props.lane.status}
+      >
+        {status().glyph}
+      </span>
+      <span
+        class={`min-w-0 truncate font-mono group-hover/lane:underline ${hue()}`}
+        classList={{ "font-semibold": status().isRed }}
+      >
+        {props.lane.id}
+      </span>
+      {/* Attempts beyond the first, then the two facts a lane cannot say in its
+       *  id: how long it took, and which machine it landed on. */}
+      <Show when={props.lane.attempt > 1}>
+        <span class="shrink-0 text-fg-3">#{props.lane.attempt}</span>
+      </Show>
+      <span class="ml-auto shrink-0 tabular-nums text-fg-3">
+        {props.lane.durationMs === null
+          ? ""
+          : compactPhrase(props.lane.durationMs)}
+      </span>
+      <span class="shrink-0 font-mono text-fg-3">{props.lane.host ?? ""}</span>
+      {props.children}
+    </>
+  );
+};
+
+/** THE way an odu surface in this section reaches odu web — one wrapper for the
+ *  lane rows, the recent-runs rows and the chip, so the reach decision, the
+ *  "open in odu" affordance and the door-opening click exist once.
+ *
+ *  A REAL anchor whenever an address exists (⌘-click, copy and "open in new tab"
+ *  are then the browser's own) and a button when that address needs a door
+ *  opened first: there is nothing to copy yet, and the address does not exist
+ *  until the relay is listening.
+ *
+ *  WHICH wrapper is a LIVE fact, not a first-paint one: a door opening turns the
+ *  element from a button into an anchor with no other event, and cancelling the
+ *  door turns it back. So the arms are read through memos OUTSIDE the `Show`'s
+ *  condition — `Show` hands its child the value it matched, and a branch that
+ *  read `act()` again inside that child would take one snapshot of it
+ *  (`PortRow`'s ready-href does the same).
+ *
+ *  With no outlet (a test rendering this section without the wire) the content
+ *  is inert: a row is worth showing even when nothing offers a way out. */
+const OduLink: Component<{
+  /** Where this subject lives, or `undefined` when nothing points at it. */
+  act: () => OduLinkAct | undefined;
+  onOpen: () => void;
+  /** The link's own testid — omitted where the content marks itself. */
+  testid?: string;
+  /** What the element's own row looks like (`ROW`, `INERT`, …). */
+  class: string;
+  children: JSX.Element;
+}> = (props) => {
+  /** The address, when there is one — the arm as a REACTIVE VALUE, so the row
+   *  becomes an anchor the moment a door is listening. */
+  const href = createMemo(() => {
+    const act = props.act();
+    return act !== undefined && act.kind === "address" ? act.href : undefined;
+  });
+  /** …and the other arm: a door has to be opened first. */
+  const opensDoor = createMemo(() => props.act()?.kind === "door");
+  return (
+    <Show
+      when={href()}
+      fallback={
+        <Show
+          when={opensDoor()}
+          fallback={<div class={props.class}>{props.children}</div>}
+        >
+          <button
+            type="button"
+            class={`${props.class} group/lane cursor-pointer text-left`}
+            title={ODU_TITLE}
+            data-testid={props.testid}
+            onClick={() => props.onOpen()}
+          >
+            {props.children}
+          </button>
+        </Show>
+      }
+    >
+      {(url) => (
+        <a
+          href={url()}
+          target="_blank"
+          rel="noopener noreferrer"
+          class={`${props.class} group/lane`}
+          title={ODU_TITLE}
+          data-testid={props.testid}
+        >
+          {props.children}
+        </a>
+      )}
+    </Show>
+  );
+};
 
 /** Repo identity chip — monogram + name in the shared repo-colour frame. The
  *  caller supplies the paint; where that hue comes from is `identity()`'s
@@ -135,6 +340,20 @@ const BranchIdentityChip: Component<{
 
 const WorkSection: Component<{
   meta: TerminalMetadata;
+  /** The checkout's odu CI readout, already subscribed by the Inspector (see
+   *  `useOduCiStatus`): `null` when odu has nothing to say about this checkout —
+   *  no daemon on this host, or no runs — in which case nothing here renders.
+   *  Optional so the section still renders in a test without a wire. */
+  oduCi?: CiStatusFrame | null;
+  /** Why the readout FAILED, when it did — a daemon that answered and could not
+   *  be read is not "no odu here", so it gets a row of its own instead of the
+   *  blank that means absence. */
+  oduCiError?: string | null;
+  /** How an odu surface here reaches odu web — the Inspector's own composition
+   *  of the forwards vocabulary (`useOduLink`), passed in because this section
+   *  is deliberately wire-free (see the header). Absent in a test that renders
+   *  without one, in which case the rows are inert text. */
+  odu?: OduLinkOutlet;
 }> = (props) => {
   /** The git facts AND their paint, as ONE value. Paint is a pure function of
    *  the SAME `git` the chips render — `assignColors` hues by key string alone,
@@ -210,6 +429,62 @@ const WorkSection: Component<{
       },
     };
   });
+  /** odu's readout for this checkout, folded for painting: the chip's rollup,
+   *  the lanes in the run's own schedule sorted into this face's triage, and the
+   *  recent runs. `null` when odu has nothing to say, which is the whole of "a
+   *  non-odu user's Inspector is unchanged". */
+  const odu = createMemo(() => {
+    const frame = props.oduCi;
+    if (frame === null || frame === undefined || frame.kind !== "status") {
+      return null;
+    }
+    const { run, lanes: scheduled } = frame.latest;
+    // odu sends the run's own schedule (the order a dashboard paints); the
+    // order a READER wants first is this face's triage, beside the check list's.
+    const lanes = [...scheduled].sort((a, b) => laneRank(a) - laneRank(b));
+    // odu's own reading of a row: the verdict once there is one, and where the
+    // run has got to until then. A run torn down early settles `incomplete` and
+    // must not be painted `failed` — that sends a reader looking for a test
+    // that broke.
+    const status = runStatus(run);
+    const word = status.label;
+    // odu's own qualifier for what the run COVERED (`@odu/service-client/board`
+    // owns the reading), and `null` when that is the whole pipeline — where a
+    // qualifier would say nothing at all.
+    const scope = scopeSuffix(run.scope);
+    let failed = 0;
+    for (const lane of lanes) if (STATUS_META[lane.status].isRed) failed += 1;
+    return {
+      run,
+      lanes,
+      port: frame.port,
+      recent: frame.recent,
+      tone: ODU_HUE[status.hue].tone,
+      /** The rollup reads like the CI chip beside it: a count only where there
+       *  IS one to state (the failed arm — the sibling counts the verdict's own
+       *  bucket, not a neighbouring one), the verdict's own word otherwise, and
+       *  always the ref the run is known by, so a chip is never about an
+       *  unnamed commit.
+       *
+       *  A failed run with NO lane failures is not a zero: its lanes have not
+       *  arrived, or the nodes stream failed. The chip states the verdict alone
+       *  rather than counting a bucket it cannot see into. */
+      label: `${ODU_HUE[status.hue].glyph} ${
+        word === "failed" && failed > 0 ? `${failed} ${word}` : `odu ${word}`
+      } ${oduRef(run)}`,
+      /** What this list IS: how many lanes, the exceptions among them, and the
+       *  run's SCOPE — odu's own qualifier, absent when the run covered the whole
+       *  pipeline. A selection is not a pipeline, so "3 lanes" over a
+       *  `selectors: ["ci::unit"]` run that said only `ci::unit` would read as
+       *  three lanes of an unstarted DAG. */
+      summary: `${lanes.length} ${lanes.length === 1 ? "lane" : "lanes"}${
+        failed > 0 ? ` · ${failed} failed` : ""
+      }${scope === null ? "" : ` · ${scope}`}`,
+    };
+  });
+  /** A ticking clock for the recent-runs ages — one interval for the section,
+   *  shared with every other age the client prints (`../time/clock`). */
+  const now = getClockNow();
   return (
     <Section title="Work" accent="border-accent">
       <div class="space-y-1.5">
@@ -253,6 +528,28 @@ const WorkSection: Component<{
                   )}
                 </Show>
               </>
+            )}
+          </Show>
+          {/* odu's own CI board for this checkout, beside the forge's checks —
+           *  and OUTSIDE the PR gate above, because a checkout can have odu
+           *  runs with no PR at all. Renders nothing when odu has nothing to
+           *  say (no daemon on this host, or no runs for this checkout). */}
+          <Show when={odu()}>
+            {(ci) => (
+              <OduLink
+                act={() => props.odu?.act(runHash(ci().run.runId), ci().port)}
+                onOpen={() =>
+                  props.odu?.open(runHash(ci().run.runId), ci().port)
+                }
+                class={CHIP_ROW}
+              >
+                {/* The chip marks ITSELF, so a reader finds the same surface
+                 *  whether or not an address exists yet; the element around it
+                 *  is what turns into the link. */}
+                <Chip tone={ci().tone} data-testid="inspector-odu-chip">
+                  {ci().label}
+                </Chip>
+              </OduLink>
             )}
           </Show>
         </div>
@@ -301,6 +598,137 @@ const WorkSection: Component<{
                 </ul>
               </Disclosure>
             </Show>
+          )}
+        </Show>
+
+        {/* odu answered and could not be read: say so. Absence draws nothing
+         *  (below); a broken install must not look like one. */}
+        <Show when={props.oduCiError}>
+          {(reason) => (
+            <div
+              data-testid="inspector-odu-error"
+              class="flex items-start gap-1.5 pt-1 text-[11px] leading-snug text-warning"
+            >
+              <span aria-hidden="true">⚠</span>
+              <span class="min-w-0 break-words">
+                odu CI unavailable — {reason()}
+              </span>
+            </div>
+          )}
+        </Show>
+
+        {/* odu's breakdown — reference tier, the same shape as the check list
+         *  above: a rollup chip in the row, the detail behind one disclosure.
+         *  Lanes of the LATEST run, triaged here, then this checkout's recent
+         *  runs, newest first. */}
+        <Show when={odu()}>
+          {(ci) => (
+            <Disclosure
+              summary={
+                <>
+                  {/* The heading names odu for a reader who has not heard of it,
+                   *  and links to its site: the count and the scope beside it
+                   *  are meaningless without the thing they belong to. */}
+                  <a
+                    href={ODU_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="odu: the CI runner for this checkout"
+                    class="hover:underline"
+                    data-testid="inspector-odu-link"
+                  >
+                    CI by odu ↗
+                  </a>
+                  {` · ${ci().summary}`}
+                </>
+              }
+              // Open by default: a run is the thing being watched, so there is
+              // no quiet state here worth hiding behind a click. It stays a
+              // disclosure so it can still be collapsed.
+              open
+              data-testid="inspector-odu"
+            >
+              <Show when={ci().lanes.length > 0}>
+                <div class={SUBHEAD}>Lanes</div>
+                <ul
+                  data-testid="inspector-odu-lanes"
+                  class="flex flex-col gap-0.5 text-[11px]"
+                >
+                  <For each={ci().lanes}>
+                    {(lane) => (
+                      <li>
+                        <OduLink
+                          act={() =>
+                            props.odu?.act(laneHash(ci().run, lane), ci().port)
+                          }
+                          onOpen={() =>
+                            props.odu?.open(laneHash(ci().run, lane), ci().port)
+                          }
+                          testid="inspector-odu-lane-link"
+                          class={ROW}
+                        >
+                          <LaneRow lane={lane} />
+                        </OduLink>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+              <div class={SUBHEAD}>Recent runs</div>
+              <ul
+                data-testid="inspector-odu-recent"
+                class="flex flex-col gap-0.5 text-[11px]"
+              >
+                <For each={ci().recent}>
+                  {(run, index) => (
+                    <li>
+                      <OduLink
+                        act={() =>
+                          props.odu?.act(runHash(run.runId), ci().port)
+                        }
+                        onOpen={() =>
+                          props.odu?.open(runHash(run.runId), ci().port)
+                        }
+                        testid="inspector-odu-run-link"
+                        class={RECENT_ROW}
+                      >
+                        <span class="min-w-0 truncate font-mono group-hover/lane:underline">
+                          {oduRef(run)}
+                        </span>
+                        <span
+                          class={`shrink-0 ${ODU_HUE[runStatus(run).hue].text}`}
+                        >
+                          {runStatus(run).label}
+                        </span>
+                        {/* The same compact qualifier the summary carries, and
+                         *  only when the run was scoped: a row whose run covered
+                         *  the whole pipeline has nothing extra to say, and one
+                         *  line is what keeps the list scannable. */}
+                        <Show when={scopeSuffix(run.scope)}>
+                          {(scope) => (
+                            <span
+                              class="min-w-0 truncate text-fg-3"
+                              title={scope()}
+                            >
+                              {scope()}
+                            </span>
+                          )}
+                        </Show>
+                        {/* The head of this list IS the run the chip above is
+                         *  about — said, rather than left to be inferred from an
+                         *  ordering. */}
+                        <Show when={index() === 0}>
+                          <span class="shrink-0 text-fg-3">current</span>
+                        </Show>
+                        <span class="ml-auto shrink-0 text-fg-3">
+                          {agoPhrase(run.createdAt, now())}
+                        </span>
+                      </OduLink>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Disclosure>
           )}
         </Show>
 

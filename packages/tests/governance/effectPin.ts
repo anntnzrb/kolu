@@ -84,24 +84,31 @@ export function isEffectFamily(pkg: string): boolean {
   return pkg === "effect" || pkg.startsWith("@effect/");
 }
 
-/** The manifest grafted in from the `osfacts` pin — juspay/osfacts'
- *  `client-ts/package.json`, which is authored and installed in THAT repo's
- *  workspace. Not `startsWith`: only the graft ROOT is the manifest we mean. */
-export function isGraftedManifest(relPath: string): boolean {
-  return relPath === "osfacts-client/package.json";
-}
-
 /** Why a manifest owes a LITERAL version rather than `catalog:` — the phrase the
  *  gate's message uses, so a failure explains itself instead of naming a rule.
- *  `null` for the ordinary workspace member, which owes `catalog:`. */
+ *  `null` for the ordinary workspace member, which owes `catalog:`.
+ *
+ *  `grafted` holds the manifests kolu GRAFTED from an npins pin rather than
+ *  authored here, by EXACT repo-relative path — the graft ROOT's own manifest,
+ *  never one merely under it. Those are authored and installed in THEIR repo's
+ *  workspace, where kolu's catalog does not exist, so they owe a literal for the
+ *  same reason a vendored package's closure does — and kolu must not be told to
+ *  edit a manifest it does not own. The set comes from the emitted
+ *  `nix/consumer-closure.json` (Nix's own `pinnedPins`, which the consumer
+ *  recipe is checked against), so a fourth graft joins by being pinned rather
+ *  than by being remembered here. */
 export function literalReason(
   relPath: string,
   vendored: ReadonlySet<string>,
+  grafted: ReadonlySet<string>,
 ): string | null {
+  // GRAFTED FIRST: a grafted member is also in the vendored closure, and the
+  // sentence for that case ("replace `catalog:` with a literal") would tell a
+  // reader to edit a manifest kolu does not own.
+  if (grafted.has(relPath))
+    return "a manifest grafted from an npins pin; it is authored in that repo's own workspace, where kolu's catalog does not exist";
   if (vendored.has(relPath))
     return "in a vendored package's dependency closure; `catalog:` is workspace-local and does not resolve for the repo that copies these directories (drishti/odu, olai)";
-  if (isGraftedManifest(relPath))
-    return "the manifest grafted from the `osfacts` pin; it is authored in juspay/osfacts' own workspace, where kolu's catalog does not exist";
   return null;
 }
 
@@ -223,6 +230,7 @@ function describe(pin: EffectPin): string {
 export function validateEffectPins(
   pins: readonly EffectPin[],
   vendored: ReadonlySet<string>,
+  grafted: ReadonlySet<string>,
 ): string {
   const problems: string[] = [];
   const catalog = pins.filter((pin) => pin.where === "catalog");
@@ -276,7 +284,7 @@ export function validateEffectPins(
       );
       continue;
     }
-    const reason = literalReason(pin.path, vendored);
+    const reason = literalReason(pin.path, vendored, grafted);
     if (reason !== null) {
       if (pin.spec === version) {
         if (vendored.has(pin.path)) vendoredLiterals += 1;

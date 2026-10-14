@@ -31,6 +31,7 @@
       "workspace": [],
       "external": {
         "@babel/parser": "^7.29.2",
+        "effect": "catalog:",
         "vitest": "*"
       }
     },
@@ -69,6 +70,7 @@
         "@kolu/surface-daemon-supervisor",
         "@kolu/surface-remote",
         "@kolu/terminal-vocab",
+        "@odu/service-client",
         "anyagent",
         "anyforge",
         "kaval",
@@ -105,6 +107,7 @@
         "@kolu/surface-daemon",
         "@kolu/surface-daemon-supervisor",
         "@kolu/terminal-vocab",
+        "@odu/service-client",
         "anyagent",
         "anyforge",
         "kolu-agents",
@@ -497,6 +500,55 @@
         "solid-js": "^1.9.0"
       }
     },
+    "@odu/run-client": {
+      "dir": "odu/run-client",
+      "pin": {
+        "name": "odu",
+        "revision": "d8afe03fd2bb158637b8c801da555a736757841f",
+        "subdir": "packages/run-client"
+      },
+      "vendored": true,
+      "workspace": [
+        "@kolu/surface"
+      ],
+      "external": {
+        "effect": "4.0.0"
+      }
+    },
+    "@odu/run-history": {
+      "dir": "odu/run-history",
+      "pin": {
+        "name": "odu",
+        "revision": "d8afe03fd2bb158637b8c801da555a736757841f",
+        "subdir": "packages/run-history"
+      },
+      "vendored": true,
+      "workspace": [
+        "@odu/run-client"
+      ],
+      "external": {
+        "effect": "4.0.0"
+      }
+    },
+    "@odu/service-client": {
+      "dir": "odu/service-client",
+      "pin": {
+        "name": "odu",
+        "revision": "d8afe03fd2bb158637b8c801da555a736757841f",
+        "subdir": "packages/service-client"
+      },
+      "vendored": true,
+      "workspace": [
+        "@kolu/surface",
+        "@kolu/surface-app",
+        "@kolu/surface-daemon",
+        "@odu/run-client",
+        "@odu/run-history"
+      ],
+      "external": {
+        "effect": "4.0.0"
+      }
+    },
     "anyagent": {
       "dir": "packages/integrations/anyagent",
       "vendored": true,
@@ -642,6 +694,8 @@
         "@kolu/theme",
         "@kolu/url-shape",
         "@kolu/xterm-kit",
+        "@odu/run-client",
+        "@odu/service-client",
         "kolu-agents",
         "memorable-names",
         "nonempty",
