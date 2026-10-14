@@ -105,8 +105,15 @@ const BootStalledCanvas: Component<{
     return leg === undefined ? CONNECTOR_STALLED_COPY : bootStalledCopy(leg);
   });
   // The live phase detail — the connector card's only per-phase narration (the client arm's
-  // `connectorPhase` is `undefined`, and `bootStalledPhaseDetail(undefined)` is `undefined`).
-  const detail = createMemo(() => bootStalledPhaseDetail(connectorPhase()));
+  // `connectorPhase` is `undefined`, and `bootStalledPhaseDetail(undefined)` is `undefined`) —
+  // with the campaign's last line and how long nothing has followed it, as the recovery
+  // states it. A string memo, so a tick that moved no whole minute writes nothing.
+  const detail = createMemo(() =>
+    bootStalledPhaseDetail(
+      connectorPhase(),
+      props.recovery.via === "connector" ? props.recovery.quiet : undefined,
+    ),
+  );
   const dataAttrs = createMemo((): Record<string, string> => {
     const leg = clientLeg();
     return leg === undefined
