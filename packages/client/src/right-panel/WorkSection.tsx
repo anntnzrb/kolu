@@ -22,10 +22,13 @@ import { agoPhrase, compactPhrase } from "@kolu/terminal-vocab/duration";
 import { shortSha } from "@odu/run-client/nodeId";
 import { logHash, runHash } from "@odu/service-client/routes";
 import {
+  type LaneSpan,
+  laneSpan,
   runElapsedMs,
   runStatus,
   scopeSuffix,
   type StatusHue,
+  timelineTicks,
 } from "@odu/service-client/board";
 import {
   STATUS_META,
@@ -140,7 +143,11 @@ const ODU_URL = "https://juspay.github.io/odu/";
  *  already keeps for check outcomes.
  *
  *  `violet` is odu's "the owner is gone": a failure to a reader, and kolu's
- *  `Chip` has no violet, so it wears `danger` there and `alert` in text. */
+ *  `Chip` has no violet, so it wears `danger` there and `alert` in text.
+ *
+ *  `text` paints the TIMELINE BAR too, through `bg-current`: a second entry for
+ *  the bar's own colour would be a second place for a hue to disagree with its
+ *  glyph, which is the whole thing this table exists to prevent. */
 const ODU_HUE: Record<
   StatusHue,
   { tone: "neutral" | "ok" | "warning" | "danger"; glyph: string; text: string }
@@ -184,9 +191,13 @@ const SUBHEAD =
  *
  *  A cell is ALWAYS present, even when it has nothing to say: a row that
  *  omitted its empty attempt or scope would shift every later column left and
- *  take the alignment with it. */
+ *  take the alignment with it.
+ *
+ *  The lane id outweighs its timeline track, deliberately: the track is a
+ *  PICTURE and shrinks gracefully, while an id shortened past `ci::install@…`
+ *  stops naming the work the row is about. */
 const LANE_GRID =
-  "grid grid-cols-[auto_minmax(0,1fr)_auto_auto_auto] gap-x-1.5 gap-y-0.5 text-[11px]";
+  "grid grid-cols-[auto_minmax(0,1.6fr)_auto_minmax(2.5rem,1fr)_auto_auto] gap-x-1.5 gap-y-0.5 text-[11px]";
 const RECENT_GRID =
   "grid grid-cols-[minmax(0,auto)_auto_auto_minmax(0,1fr)_auto_auto] gap-x-1.5 gap-y-0.5 text-[11px]";
 const ROW = "col-span-full grid grid-cols-subgrid items-center";
@@ -194,14 +205,42 @@ const ROW = "col-span-full grid grid-cols-subgrid items-center";
 const CHIP_ROW = "inline-flex";
 const ODU_TITLE = "open in odu";
 
-/** One lane: its own facts, and the way out to that attempt's log in odu web.
+/** One lane: its own facts, where it sat in the run, and the way out to that
+ *  attempt's log in odu web.
  *
  *  Long output is READ in odu's own page (searchable, coloured, followed live),
  *  so a lane's row is the link to it — the whole row, because every fact on it is
  *  about one attempt. */
-const LaneRow: Component<{ lane: RunNode }> = (props) => {
+const LaneRow: Component<{
+  lane: RunNode;
+  /** WHERE this lane sat in the run, from odu's own geometry — `null` where
+   *  there is no span to know: a lane still waiting on a machine, or one that
+   *  stopped without ever running. Either way the empty track IS the signal.
+   *  Its `kind`, its `left`/`width` and its milliseconds are all the same
+   *  answer, so nothing here re-derives any of them. */
+  span: LaneSpan | null;
+}> = (props) => {
   const status = () => STATUS_META[props.lane.status];
   const hue = () => ODU_HUE[status().hue].text;
+  /** THE BAR, or nothing — one reading, so "is there a bar" is asked once
+   *  rather than split across two conditions a reader has to recombine. A span
+   *  that begins AT the track's end is the clamp's answer for a lane whose
+   *  start outran the run; it has nowhere to be drawn. A zero-WIDTH span is not
+   *  the same thing — a node that genuinely took no measurable time has
+   *  `durationMs: 0`, which is the case the bar's minimum width exists for. */
+  const bar = (): LaneSpan | null => {
+    const span = props.span;
+    return span === null || span.left >= 1 ? null : span;
+  };
+  /** What the bar says when you point at it, in the ladder the row's own cells
+   *  print — spelled off the SPAN's clamped milliseconds, so the tooltip and
+   *  the bar cannot tell different stories about a skewed lane host. */
+  const barTitle = (span: LaneSpan): string =>
+    `started +${compactPhrase(span.startedAfterMs)} · ${
+      span.kind === "running"
+        ? "still running"
+        : `took ${compactPhrase(span.tookMs)}`
+    }`;
   return (
     <>
       <span class={`w-3 text-center ${hue()}`} title={props.lane.status}>
@@ -219,6 +258,38 @@ const LaneRow: Component<{ lane: RunNode }> = (props) => {
        *  of the row out from under the column above it. */}
       <span class="text-fg-3">
         {props.lane.attempt > 1 ? `#${props.lane.attempt}` : ""}
+      </span>
+      {/* THE TIMELINE — a Gantt, so the bar's POSITION says when this lane ran
+       *  and the column says what overlapped what. The bar wears the hue's TEXT
+       *  class and paints with `bg-current`, so it cannot disagree with the
+       *  glyph; a lane still arriving is hatched END TO END in that same
+       *  colour, because every millisecond of that bar is measured against a
+       *  clock the next tick moves.
+       *
+       *  `kind` is the geometry's OWN arm, not a second reading of
+       *  `durationMs`: a lane that stopped without ever running has no duration
+       *  either, and painting it as "still arriving" is exactly the lie the
+       *  span exists to prevent. The track clips, so a clamped bar carrying its
+       *  minimum width cannot cross the edge the axis calls the total. */}
+      <span class="relative h-2.5 self-center overflow-hidden rounded-sm bg-fg-3/10">
+        <Show when={bar()}>
+          {(span) => (
+            <span
+              data-testid="inspector-odu-lane-bar"
+              class={`absolute inset-y-0 min-w-0.5 rounded-sm opacity-60 ${hue()}`}
+              classList={{
+                "bg-current": span().kind === "settled",
+                "bg-[repeating-linear-gradient(135deg,currentColor_0_3px,transparent_3px_6px)]":
+                  span().kind === "running",
+              }}
+              style={{
+                left: `${span().left * 100}%`,
+                width: `${span().width * 100}%`,
+              }}
+              title={barTitle(span())}
+            />
+          )}
+        </Show>
       </span>
       <span class="text-right tabular-nums text-fg-3">
         {props.lane.durationMs === null
@@ -707,6 +778,50 @@ const WorkSection: Component<{
               <Show when={ci().lanes.length > 0}>
                 <div class={SUBHEAD}>Lanes</div>
                 <ul data-testid="inspector-odu-lanes" class={LANE_GRID}>
+                  {/* THE SCALE the bars are read against, over the track column
+                   *  alone — placed by column rather than as a full row of
+                   *  empty cells, so the axis cannot drift from the track it
+                   *  labels. Ticks are odu's own, like the geometry: a
+                   *  hand-rolled scale here would be a second answer to where
+                   *  the middle of a run is.
+                   *
+                   *  EVERY tick is marked; only the ENDS are labelled. The
+                   *  Inspector's track is a few dozen pixels wide, where four
+                   *  durations collide into one smear — and the two a reader
+                   *  needs are the origin and the total. Which labels fit is
+                   *  this panel's business; where the marks go is not. */}
+                  <li
+                    data-testid="inspector-odu-lane-axis"
+                    aria-hidden="true"
+                    class="relative col-start-4 h-3 text-[10px] text-fg-3"
+                  >
+                    <For each={timelineTicks(ci().run, now())}>
+                      {(tick) => (
+                        <span
+                          class="absolute top-0 border-l border-edge pl-0.5"
+                          classList={{
+                            // The last mark sits ON the track's right edge, so
+                            // it hangs its rule and its label inward; asked by
+                            // POSITION rather than by an index, which would be
+                            // this file holding an opinion about how many marks
+                            // odu mints.
+                            "-translate-x-full border-l-0 border-r pr-0.5 pl-0":
+                              tick.at === 1,
+                          }}
+                          style={{ left: `${tick.at * 100}%` }}
+                        >
+                          {/* kolu's OWN ladder, the one every duration in this
+                           *  section already prints — odu's tick carries a
+                           *  position and a number, never a spelling, so an
+                           *  axis never reads `55.4s` over a cell that reads
+                           *  `55s`. */}
+                          {tick.at === 0 || tick.at === 1
+                            ? compactPhrase(tick.ms)
+                            : ""}
+                        </span>
+                      )}
+                    </For>
+                  </li>
                   <For each={ci().lanes}>
                     {(lane) => (
                       <li class={ROW}>
@@ -718,7 +833,10 @@ const WorkSection: Component<{
                           testid="inspector-odu-lane-link"
                           class={ROW}
                         >
-                          <LaneRow lane={lane} />
+                          <LaneRow
+                            lane={lane}
+                            span={laneSpan(lane, ci().run, now())}
+                          />
                         </OduLink>
                       </li>
                     )}
