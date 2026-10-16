@@ -58,13 +58,15 @@ nix_shell := if env('IN_NIX_SHELL', '') != '' { '' } else { 'nix develop --accep
 #   * Website, example, and CI-tool Nix outputs live in independent subflakes.
 #     Their nodes depend on `nix` so Nix builds do not fight over CPU, memory,
 #     and store locks; each remains a separate status and source boundary.
-#   * Every other node that invokes `nix build` depends on `nix`:
-#     home-manager, e2e's `.#koluBin`, smoke's `.#default`, and the pnpm hash
-#     rebuild. Their commands remain self-contained, but start from a warmed
-#     store after the root evaluator/build process has exited instead of
-#     competing with it for CPU, memory, and Nix locks.
+#   * Every other node that invokes `nix build` depends on `nix`: e2e's
+#     `.#koluBin`, smoke's `.#default`, and the pnpm hash rebuild. Their
+#     commands remain self-contained, but start from a warmed store after the
+#     root evaluator/build process has exited instead of competing with it for
+#     CPU, memory, and Nix locks.
+#   * `home-manager` is the one deliberate exception — its recipe owns why.
 #
-# This intentionally trades critical-path length for lower peak contention.
+# The remaining edges intentionally trade critical-path length for lower peak
+# contention.
 [linux]
 [macos]
 [parallel]
@@ -172,11 +174,14 @@ odu-nix: nix
     bash ci/flake-build --kinds packages ./ci
     nix flake check ./ci --no-build --accept-flake-config -L
 
-# Build the separate home-manager example flake after the root Nix gate has
-# warmed kolu's store paths. Darwin checks the activation package and launchd
-# configuration. Linux checks the NixOS configuration and runs the service,
-# adoption, and upgrade VM tests.
-home-manager: nix
+# Build the separate home-manager example flake. Deliberately NOT dependent on
+# `nix`: `--override-input kolu .` builds the same kolu derivations `ci::nix`
+# builds, and Nix's per-derivation build lock makes whichever node arrives
+# second WAIT, never rebuild — so an edge guards nothing and only serializes
+# this node behind the root gate. Darwin checks the activation package and
+# launchd configuration. Linux checks the NixOS configuration and runs the
+# service, adoption, and upgrade VM tests.
+home-manager:
     if [ "$(uname)" = Darwin ]; then \
       bash ci/flake-build --kinds checks ./nix/home/example -- --override-input kolu .; \
     else \
@@ -285,9 +290,15 @@ unit: install
 # call sites disagree). Before that split every fork-free test in the tree ran
 # twice per run — the whole `unit` node, ~5m, on the critical path for nothing.
 #
-# `unit` must still finish first: running two pnpm/Vitest trees concurrently was
-# externally SIGKILLed on petit even with each tree's package concurrency
-# bounded to one.
+# `daemon` deliberately does NOT depend on `unit`. Its lone incident — the macOS
+# `petit` SIGKILL pair (docs/ci-flakes.md) — had two causes, unbounded package
+# concurrency and `unit`/`daemon` traversing the same workspace, and the root
+# recipes' `--workspace-concurrency=1` bound and the partition above each fixed
+# one. So it was a third fix for a cause the other two had already removed — a
+# darwin remedy, levied on the Linux lane.
+#
+# What it cost was structural: `unit` on `daemon`'s critical path, and that
+# closure replayed on every borrowed shard box before its own slice.
 #
 # SHARDED (the shard contract is at the top of this file): the Linux lane's
 # second-longest pole. Its wall time is a handful of expensive FILES, not one
@@ -297,7 +308,8 @@ unit: install
 #
 # N is MEASURED, not guessed. One run at a time with the whole pool free
 # (`selectors: ["ci::daemon"]`, x86_64-linux), the folded `ci::daemon` duration
-# and the slowest slice against the ceiling:
+# and the slowest slice against the ceiling — measured while the node still
+# carried the `unit` edge, so each borrowed box's closure included it:
 #
 #     N   folded daemon   slowest slice
 #     2        352 s           352 s
@@ -308,15 +320,15 @@ unit: install
 #
 # The slowest slice stops moving between 5 and 6 (146 s → 144 s, inside host
 # noise), so 5 is the ceiling: past it a shard only costs a saturated pool and
-# an extra `install`+`unit` closure without shortening the lane. The residual is
+# an extra `install` closure without shortening the lane. The residual is
 # padi's ~70 s `dial.test.ts` — ONE file, indivisible by any file-level split —
-# plus the primary box's own `install`+`unit` closure, which a shard cannot
-# borrow away. These six runs had the pool to themselves; `e2e` shares the SAME
+# plus the primary box's own `install` closure, which a shard cannot borrow
+# away. These six runs had the pool to themselves; `e2e` shares the SAME
 # optional-worker pool (each root takes a prefix up to its own ceiling, so the
 # two compete only when both are live), which is why the ceiling is not raised
 # further: a count the pool cannot feed is a wait, not a speedup.
 [metadata("odu:shard=5")]
-daemon: install unit
+daemon: install
     {{ nix_shell }} just --no-deps test-daemon
 
 # Mixed-version daemon upgrade-window — the REAL previous-release e2e (boot the
