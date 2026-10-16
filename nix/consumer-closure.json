@@ -1,9 +1,22 @@
 {
   "members": {
+    "@juspay/agent-distro": {
+      "dir": "juspay/agent-distro",
+      "pin": {
+        "name": "agent-distro",
+        "revision": "3053b529669011872666d4b16621af8af3cf38fc",
+        "subdir": "src"
+      },
+      "vendored": true,
+      "workspace": [],
+      "external": {}
+    },
     "@kolu/agent-distro": {
       "dir": "packages/agent-distro",
       "vendored": true,
-      "workspace": [],
+      "workspace": [
+        "@juspay/agent-distro"
+      ],
       "external": {
         "effect": "4.0.0",
         "solid-js": "^1.9.0"
@@ -62,6 +75,7 @@
     "@kolu/padi": {
       "dir": "packages/padi",
       "workspace": [
+        "@juspay/agent-distro",
         "@kolu/agent-distro",
         "@kolu/padi-client",
         "@kolu/serve-dir",
@@ -893,6 +907,7 @@
     "kolu-server": {
       "dir": "packages/server",
       "workspace": [
+        "@juspay/agent-distro",
         "@kolu/agent-distro",
         "@kolu/artifact-sdk",
         "@kolu/heap-diag",

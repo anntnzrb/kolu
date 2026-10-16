@@ -61,6 +61,14 @@ let
     "@odu/service-client" = "odu";
     "@odu/run-client" = "odu";
     "@odu/run-history" = "odu";
+    # agent-distro's own vocabulary — its runtime tree (`src/`), which names
+    # itself `@juspay/agent-distro` and exports the updater's pure modules (the
+    # due rule, the history line, the versions file, `--list --json`), the
+    # state directory's file names (`update/state`), the history log's one
+    # writer (`update/history-log`) and the profile-reference rules
+    # (`profile/reference`). `@kolu/agent-distro`, padi and kolu-server import
+    # them rather than repeat them.
+    "@juspay/agent-distro" = "agent-distro";
   };
   pinnedNames = builtins.attrNames pinnedPins;
 
@@ -155,6 +163,8 @@ let
     "@odu/service-client" = sources.odu + "/packages/service-client";
     "@odu/run-client" = sources.odu + "/packages/run-client";
     "@odu/run-history" = sources.odu + "/packages/run-history";
+    # The same, from the `agent-distro` pin: its runtime tree, `src/`.
+    "@juspay/agent-distro" = sources.agent-distro + "/src";
     "kolu-server" = ../packages/server;
     "kolu-client" = ../packages/client;
     "kolu-transcript-core" = ../packages/transcript-core;

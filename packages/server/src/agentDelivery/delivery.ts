@@ -1,46 +1,94 @@
 /**
- * Delivering agent-distro's bundles to every host — kolu-server's half of the
- * Agents setting, driven on agent-distro's clock, not kolu's: per run, for
- * each bound host's system, which bundle (`DeliveryOps.published`), then
- * getting it onto the host (`DeliveryOps.pull`) — nothing is ever built. The
- * host's padi is told each step (`agentDistro.report`) and points `current`
- * at what landed.
+ * Delivering the Agents setting's set to every host — kolu-server's half of
+ * the setting, driven on agent-distro's clock, not kolu's. A host's set is two
+ * disjoint things, gathered here and landed together:
+ *
+ *   - agent-distro's PACKAGE (its harnesses): which store path, off upstream's
+ *     index for the host's system (`DeliveryOps.published`), pulled by the
+ *     host from upstream's cache (`DeliveryOps.pull`) — nothing is built;
+ *   - each PROFILE of the setting's stack, in order: locked once per run
+ *     (`DeliveryOps.lock`), built with agent-distro's `mkProfile` at the
+ *     package's own revision for the host's system (`DeliveryOps.build`), and shipped into the host's
+ *     store, rooted (`DeliveryOps.ship`).
+ *
+ * The host's padi is told each step (`agentDistro.report`) and records the set
+ * that landed. A profile that will not lock, build or ship fails that host's
+ * delivery, in words that name it — whatever served there keeps serving.
  *
  * Why a run happens decides one thing ({@link DeliveryTrigger}): a host taking
  * the setting (`connect`: every bind, reconnect and real change) reuses the
- * current schedule period's index answer — a reconnect does not re-ask GitHub
- * — while the user's check (`user`) and upstream's schedule (`schedule`) read
- * the index afresh. Within one run each system's answer is read once.
+ * current schedule period's answers — a reconnect does not re-ask GitHub —
+ * while the user's check (`user`) and upstream's schedule (`schedule`) read
+ * the index, lock every reference and build every profile afresh (so an
+ * edited path profile is picked up). Within one run each answer is
+ * read once.
+ *
+ * Every run also says whether each profile builds at all (`onResolution`): it
+ * is built for this machine's own system first, and that answer is what
+ * Settings shows under the profile's entry.
  *
  * The steps are {@link DeliveryOps} (`./ops.ts` in production), so the policy
- * here is testable without a network or a host.
+ * here is testable without a network, Nix or a host.
  */
 
-import type { AgentDistroDeliveryReport } from "@kolu/agent-distro/schema";
-import { type UpdaterSchedule, updateDue } from "@kolu/agent-distro/schedule";
+import { updateDue } from "@juspay/agent-distro/update/due";
+import type { UpdaterSchedule } from "@kolu/agent-distro/bake";
+import {
+  type DeliveredProfile,
+  referencesOf,
+  sameStack,
+} from "@kolu/agent-distro/landing";
+import type {
+  AgentDistroDeliveryReport,
+  AgentDistroSetting,
+  AgentProfileResolution,
+} from "@kolu/agent-distro/schema";
 import type { Logger } from "@kolu/log";
 import type { HostNix, PublishedClosure } from "@kolu/surface-remote";
+import type { BuiltProfile, LockedProfile } from "./profiles.ts";
 
 /** The steps of a delivery. Each throws with its own words. */
 export interface DeliveryOps {
   /** The Nix system and version of the host `ssh` reaches (`localhost` for
-   *  this one) — the system picks the index entry, both pick the route. */
+   *  this one) — the system picks the index entry and a profile's build, both
+   *  pick the route. */
   hostNixOf(ssh: string): Promise<HostNix>;
-  /** `profile`'s newest published bundle for `system`, read off upstream's
-   *  index. Throws, in words a user reads, when upstream has published none
-   *  for that system or the index cannot be read — never a reason to
-   *  evaluate or build one. */
-  published(system: string, profile: string): Promise<PublishedClosure>;
+  /** The newest published package for `system`, read off upstream's index.
+   *  Throws, in words a user reads, when upstream has published none for that
+   *  system or the index cannot be read — never a reason to build one. */
+  published(system: string): Promise<PublishedClosure>;
+  /** Pin one profile reference (`./profiles.ts`' `lockProfile`). */
+  lock(reference: string): Promise<LockedProfile>;
+  /** Build a locked profile for `hostSystem` with agent-distro at `rev`
+   *  (`./profiles.ts`' `buildProfile`). */
+  build(args: {
+    readonly rev: string;
+    readonly locked: LockedProfile;
+    readonly hostSystem: string;
+  }): Promise<BuiltProfile>;
+  /** Get a built profile's closure into the host's store and root it there —
+   *  never building on the host. Answers the path it has there. */
+  ship(args: {
+    readonly ssh: string;
+    readonly label: string;
+    readonly hostNix: HostNix;
+    readonly reference: string;
+    readonly path: string;
+    readonly onProgress: (line: string) => void;
+  }): Promise<
+    | { readonly ok: true; readonly path: string }
+    | { readonly ok: false; readonly message: string }
+  >;
   /** The route: have the host — whose Nix is `hostNix` — pull `published`'s
-   *  bundle in the form it can take and run (`closureRoute`, `@kolu/surface-remote`), and root it —
-   *  never building. Answers the path that landed, or the cause in words a
-   *  user reads (`label` names the host in them). */
+   *  package in the form it can take and run (`closureRoute`,
+   *  `@kolu/surface-remote`), and root it — never building. Answers the path
+   *  that landed, or the cause in words a user reads (`label` names the host
+   *  in them). */
   pull(args: {
     readonly ssh: string;
     readonly label: string;
     readonly hostNix: HostNix;
     readonly published: PublishedClosure;
-    readonly profile: string;
     readonly onProgress: (line: string) => void;
   }): Promise<
     | { readonly ok: true; readonly bundle: string }
@@ -62,9 +110,15 @@ export interface DeliveryHost {
 export type DeliveryTrigger = "connect" | "user" | "schedule";
 
 /** How one host's delivery ended: `landed`; `failed` (retried on upstream's
- *  schedule, a reconnect, or the user's check); or `busy` (a delivery of that
- *  bundle to it was already running). */
-export type HostOutcome = "landed" | "failed" | "busy";
+ *  schedule, a reconnect, or the user's check); `busy` (a delivery of that
+ *  stack to it was already running); or `superseded` (the setting's profile
+ *  list changed while it ran — the newer list's own run delivers that, and
+ *  padi would refuse this one's landing). A superseded run lands nothing and
+ *  failed at nothing; it reports `failed` for its stack only so padi drops its
+ *  `delivering` record, which padi does silently for a stack the setting has
+ *  left. The switch going off supersedes nothing: padi judges a landing by
+ *  the list alone, and takes it. */
+export type HostOutcome = "landed" | "failed" | "busy" | "superseded";
 
 export interface AgentDelivery {
   /** Deliver to `keys` (every connected host when omitted), for `trigger`.
@@ -74,63 +128,247 @@ export interface AgentDelivery {
     readonly keys?: readonly string[];
     readonly trigger: DeliveryTrigger;
   }): Promise<readonly HostOutcome[]>;
+  /** Say whether each profile of the setting builds, for this machine
+   *  (`onResolution`), reusing this period's answers. Never rejects. */
+  resolve(): Promise<void>;
   /** A delivery is in flight. */
   running(): boolean;
 }
 
+/** A remembered answer and when it was read, epoch ms. */
+/** How a run reads: `since` — the ask count when a fresh run started, which
+ *  takes only answers asked after — or absent for a connect, which reuses the
+ *  period's. */
+interface Run {
+  readonly since?: number;
+}
+
+/** A remembered answer: when it was asked (wall clock, for the period), its
+ *  place in the order of asks (for a fresh run), and whether it failed. */
+interface Known<T> {
+  readonly value: T;
+  readonly at: number;
+  readonly ask: number;
+  failed: boolean;
+}
+
 export function createAgentDelivery(deps: {
-  /** Upstream's schedule: a connect reuses an index answer within its period. */
+  /** Upstream's schedule: a connect reuses an answer within its period. */
   readonly schedule: UpdaterSchedule;
   readonly ops: DeliveryOps;
   readonly log: Logger;
-  /** The bundle the current setting rides (`bundleProfileOf`), or `undefined`
-   *  while agents are off. Read at each run. */
-  readonly bundle: () => string | undefined;
+  /** The Agents setting, read at each run: its stack while on; its profile
+   *  list is what a run in flight is judged current against. */
+  readonly setting: () => AgentDistroSetting;
   /** Every host a delivery can reach now (connected padis). */
   readonly hosts: () => readonly DeliveryHost[];
+  /** Each profile of the stack, in order, with whether it builds — published
+   *  as the run learns it. */
+  readonly onResolution: (
+    profiles: readonly {
+      readonly reference: string;
+      readonly resolution: AgentProfileResolution;
+    }[],
+  ) => void;
   /** Wall clock, epoch ms. */
   readonly now?: () => number;
 }): AgentDelivery {
   const { schedule, ops, log } = deps;
   const now = deps.now ?? Date.now;
-  /** The last index answer per `system#profile`, and when it was read: a
-   *  host's connect reuses it within the schedule period. */
-  const known = new Map<
-    string,
-    { readonly entry: PublishedClosure; readonly at: number }
-  >();
-  /** Deliveries in flight, by `host#bundle`: a switch to ANOTHER profile is
-   *  its own delivery, never folded into the one still running. */
+  /** The last index answer per system, and the last lock per reference: a
+   *  host's connect reuses them within the schedule period. */
+  const indexed = new Map<string, Known<Promise<PublishedClosure>>>();
+  const locks = new Map<string, Known<Promise<LockedProfile>>>();
+  /** The last build per agent-distro revision, tree and system — reused like
+   *  the index and the locks, never longer: a path's tree is the user's own
+   *  directory, which changes under the same key, and a profile's plugins
+   *  named by a flake reference are locked only when it builds. */
+  const builds = new Map<string, Known<Promise<BuiltProfile>>>();
+  /** Each reference's last answer, shown while it is asked again — a re-check
+   *  of a profile that built does not flash back to `pending`; only a
+   *  reference never answered is. */
+  const lastAnswers = new Map<string, AgentProfileResolution>();
+  /** The setting's stack, or `undefined` while agents are off. */
+  const stackNow = (): readonly string[] | undefined => {
+    const setting = deps.setting();
+    return setting.enabled ? setting.profiles : undefined;
+  };
+  /** The setting's profile list is still `stack` — padi's own staleness rule
+   *  (its `report` handler compares the list alone), so a run kolu-server
+   *  calls current is one padi will take. A run that outlived its list
+   *  publishes nothing and lands nothing: the newer list's run does. */
+  const current = (stack: readonly string[]): boolean =>
+    sameStack(deps.setting().profiles, stack);
+  /** Settings shows `stack`'s answers: agents are on and it is the setting's
+   *  stack. Stricter than {@link current}, which a landing needs: the
+   *  `agentProfiles` cell is empty while agents are off, so a run that settles
+   *  after the switch went off publishes nothing. */
+  const shown = (stack: readonly string[]): boolean => {
+    const now = stackNow();
+    return now !== undefined && sameStack(now, stack);
+  };
+  /** Deliveries in flight, by `host#stack`: a change of the stack is its own
+   *  delivery, never folded into the one still running. */
   const inFlight = new Set<string>();
 
-  /** `profile`'s bundle for `system`: the period's known answer when allowed,
-   *  else a fresh read of the index (remembered on success). */
-  const readIndex = async (
-    system: string,
-    profile: string,
-    fresh: boolean,
-  ): Promise<PublishedClosure> => {
-    const key = `${system}#${profile}`;
-    const last = known.get(key);
+  /** Every answer asked, counted: a fresh run takes only answers asked after
+   *  it started (a count, never the clock — two asks in one millisecond are
+   *  still ordered). */
+  let asks = 0;
+
+  /** A remembered answer, or a new one. A run that may reuse (a connect,
+   *  `since` absent) takes a settled-well answer while its schedule period
+   *  has not turned; a fresh run (the user's check, the schedule) takes only
+   *  one asked since it started — failed or not, so its hosts share ONE
+   *  read, lock and build, and see the same answer. The PROMISE is remembered
+   *  the moment it is asked, so runs that overlap share it too; a failed one
+   *  is never handed to a later run, which asks again. */
+  const reuse = <T>(
+    memo: Map<string, Known<Promise<T>>>,
+    key: string,
+    run: Run,
+    read: () => Promise<T>,
+  ): Promise<T> => {
+    const last = memo.get(key);
     if (
-      !fresh &&
       last !== undefined &&
-      !updateDue(Math.floor(now() / 1000), Math.floor(last.at / 1000), schedule)
+      (run.since === undefined
+        ? !last.failed &&
+          !updateDue(
+            Math.floor(now() / 1000),
+            Math.floor(last.at / 1000),
+            schedule.periodSeconds,
+            schedule.offsetSeconds,
+          )
+        : last.ask > run.since)
     )
-      return last.entry;
-    const entry = await ops.published(system, profile);
-    known.set(key, { entry, at: now() });
-    log.info(
-      {
-        system,
-        agentDistroProfile: profile,
-        rev: entry.rev,
-        ia: entry.ia,
-        ca: entry.ca,
+      return last.value;
+    const value = read();
+    const known: Known<Promise<T>> = {
+      value,
+      at: now(),
+      ask: ++asks,
+      failed: false,
+    };
+    memo.set(key, known);
+    value.catch(() => {
+      known.failed = true;
+    });
+    return value;
+  };
+
+  const readIndex = (system: string, run: Run) =>
+    reuse(indexed, system, run, async () => {
+      const entry = await ops.published(system);
+      log.info(
+        { system, rev: entry.rev, ia: entry.ia, ca: entry.ca },
+        "agent-distro index read",
+      );
+      return entry;
+    });
+
+  const readLock = (reference: string, run: Run) =>
+    reuse(locks, reference, run, async () => {
+      const locked = await ops.lock(reference);
+      log.info(
+        { reference, tree: locked.tree, rev: locked.rev },
+        "agent-distro profile locked",
+      );
+      return locked;
+    });
+
+  const readBuild = (
+    rev: string,
+    locked: LockedProfile,
+    hostSystem: string,
+    run: Run,
+  ) =>
+    reuse(
+      builds,
+      JSON.stringify([rev, locked.tree, hostSystem]),
+      run,
+      async () => {
+        const built = await ops.build({ rev, locked, hostSystem });
+        log.info(
+          { reference: locked.reference, hostSystem, path: built.path },
+          "agent-distro profile built",
+        );
+        return built;
       },
-      "agent-distro index read",
     );
-    return entry;
+
+  /** Lock and build `reference` for `hostSystem`, with the package's `rev`. */
+  const profileFor = async (
+    run: Run,
+    reference: string,
+    rev: string,
+    hostSystem: string,
+  ): Promise<{ locked: LockedProfile; built: BuiltProfile }> => {
+    const locked = await readLock(reference, run);
+    return { locked, built: await readBuild(rev, locked, hostSystem, run) };
+  };
+
+  /** Say, for this machine's system, whether each profile of `stack` builds. */
+  const resolveStack = async (
+    stack: readonly string[],
+    run: Run,
+  ): Promise<void> => {
+    if (stack.length === 0) {
+      if (shown(stack)) deps.onResolution([]);
+      return;
+    }
+    const answers = new Map<string, AgentProfileResolution>();
+    const publish = () => {
+      // Gate first: an answer Settings no longer shows — an outdated run's, or
+      // one settling after the switch went off — is neither published nor
+      // remembered, so one can never stand in for a newer answer later.
+      if (!shown(stack)) return;
+      for (const [reference, answer] of answers)
+        lastAnswers.set(reference, answer);
+      deps.onResolution(
+        stack.map((reference) => ({
+          reference,
+          resolution: answers.get(reference) ??
+            lastAnswers.get(reference) ?? { kind: "pending" },
+        })),
+      );
+    };
+    publish();
+    try {
+      const { system } = await ops.hostNixOf("localhost");
+      const { rev } = await readIndex(system, run);
+      await Promise.all(
+        stack.map(async (reference) => {
+          try {
+            const { locked, built } = await profileFor(
+              run,
+              reference,
+              rev,
+              system,
+            );
+            answers.set(reference, {
+              kind: "resolved",
+              name: built.name,
+              description: built.description,
+              ...(locked.rev === undefined ? {} : { rev: locked.rev }),
+            });
+          } catch (err) {
+            answers.set(reference, {
+              kind: "failed",
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+          publish();
+        }),
+      );
+    } catch (err) {
+      // The index or this machine's Nix did not answer: no profile can be
+      // built here, and each says why.
+      const message = err instanceof Error ? err.message : String(err);
+      for (const reference of stack)
+        answers.set(reference, { kind: "failed", message });
+      publish();
+    }
   };
 
   const report = async (
@@ -141,78 +379,146 @@ export function createAgentDelivery(deps: {
       await host.report(r);
     } catch (err) {
       // The host's padi did not take the report (it dropped, or refused a
-      // landing it cannot hold): logged at error, and the outcome below is the
-      // delivery's own.
-      log.error(
-        { err, host: host.label, report: r.kind },
-        "agent-distro delivery report to padi failed",
-      );
+      // landing it cannot hold) — unless the setting moved on meanwhile, when
+      // padi's refusal of a stale landing is the expected answer: logged at
+      // error, and the outcome below is the delivery's own.
+      if (
+        r.kind === "delivering" ||
+        current(r.kind === "landed" ? referencesOf(r.set.profiles) : r.profiles)
+      )
+        log.error(
+          { err, host: host.label, report: r.kind },
+          "agent-distro delivery report to padi failed",
+        );
       throw err;
     }
   };
 
   const deliverOne = async (
     host: DeliveryHost,
-    profile: string,
-    /** One index read per system per run, shared by its hosts. */
-    bundleFor: (system: string) => Promise<PublishedClosure>,
+    stack: readonly string[],
+    run: Run,
   ): Promise<HostOutcome> => {
-    const at = { host: host.label, agentDistroProfile: profile };
+    const at = { host: host.label, agentDistroProfiles: stack };
+    const onProgress = (line: string) =>
+      log.debug({ ...at, line }, "agent-distro delivery");
+    const superseded = async (): Promise<HostOutcome> => {
+      log.info(
+        { ...at, now: deps.setting().profiles },
+        "agent-distro delivery superseded by a newer profile list",
+      );
+      // The terminal report padi drops silently for a list the setting has
+      // left — so its `delivering` record for this stack ends with the run.
+      await report(host, {
+        kind: "failed",
+        profiles: stack,
+        message:
+          "superseded: the Agents profile list changed while this delivery ran",
+      }).catch(() => {});
+      return "superseded";
+    };
+    const failed = async (message: string): Promise<HostOutcome> => {
+      if (!current(stack)) return await superseded();
+      log.warn({ ...at, message }, "agent-distro set not delivered");
+      await report(host, { kind: "failed", profiles: stack, message }).catch(
+        () => {},
+      );
+      return "failed";
+    };
     try {
       const hostNix = await ops.hostNixOf(host.ssh);
-      const published = await bundleFor(hostNix.system);
+      const published = await readIndex(hostNix.system, run);
+      const delivered: DeliveredProfile[] = [];
+      for (const reference of stack) {
+        let built: BuiltProfile;
+        let locked: LockedProfile;
+        try {
+          ({ locked, built } = await profileFor(
+            run,
+            reference,
+            published.rev,
+            hostNix.system,
+          ));
+        } catch (err) {
+          return await failed(
+            `the ${reference} profile: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        const shipped = await ops.ship({
+          ssh: host.ssh,
+          label: host.label,
+          hostNix,
+          reference,
+          path: built.path,
+          onProgress,
+        });
+        if (!shipped.ok)
+          return await failed(`the ${built.name} profile: ${shipped.message}`);
+        delivered.push({
+          reference,
+          name: built.name,
+          ...(locked.rev === undefined ? {} : { rev: locked.rev }),
+          path: shipped.path,
+        });
+      }
       const res = await ops.pull({
         ssh: host.ssh,
         label: host.label,
         hostNix,
         published,
-        profile,
-        onProgress: (line) =>
-          log.debug({ ...at, line }, "agent-distro delivery"),
+        onProgress,
       });
-      if (res.ok) {
-        await report(host, { kind: "landed", profile, bundle: res.bundle });
-        log.info(
-          { ...at, bundle: res.bundle },
-          "agent-distro bundle delivered",
-        );
-        return "landed";
-      }
-      const { message } = res;
-      log.warn({ ...at, message }, "agent-distro bundle not delivered");
-      await report(host, { kind: "failed", profile, message });
-      return "failed";
+      if (!res.ok) return await failed(res.message);
+      if (!current(stack)) return await superseded();
+      const set = { bundle: res.bundle, profiles: delivered };
+      await report(host, { kind: "landed", set });
+      log.info({ ...at, set }, "agent-distro set delivered");
+      return "landed";
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      if (!current(stack)) return await superseded();
       log.warn({ ...at, err }, "agent-distro delivery failed");
-      await report(host, { kind: "failed", profile, message }).catch(() => {});
-      return "failed";
+      return await failed(err instanceof Error ? err.message : String(err));
     }
   };
 
   return {
     running: () => inFlight.size > 0,
+    resolve: async () => {
+      const stack = stackNow();
+      if (stack === undefined) {
+        deps.onResolution([]);
+        return;
+      }
+      await resolveStack(stack, {});
+    },
     run: async ({ keys, trigger }) => {
-      const profile = deps.bundle();
-      if (profile === undefined) return [];
+      const stack = stackNow();
+      if (stack === undefined) return [];
+      const slotOf = (h: DeliveryHost) => `${h.key}#${JSON.stringify(stack)}`;
       const targets = deps
         .hosts()
         .filter((h) => keys === undefined || keys.includes(h.key));
       const ours: DeliveryHost[] = [];
       const outcomes: HostOutcome[] = [];
       for (const host of targets) {
-        const slot = `${host.key}#${profile}`;
-        if (inFlight.has(slot)) outcomes.push("busy");
+        if (inFlight.has(slotOf(host))) outcomes.push("busy");
         else {
-          inFlight.add(slot);
+          inFlight.add(slotOf(host));
           ours.push(host);
         }
       }
-      if (ours.length === 0) return outcomes;
+      const run: Run = trigger === "connect" ? {} : { since: asks };
+      // Settings learns whether each profile builds, whether or not a host is
+      // reachable this run.
+      const resolved = resolveStack(stack, run);
+      if (ours.length === 0) {
+        await resolved;
+        return outcomes;
+      }
       try {
         const started = await Promise.all(
           ours.map((h) =>
-            report(h, { kind: "delivering", profile }).then(
+            report(h, { kind: "delivering", profiles: stack }).then(
               () => h,
               () => undefined,
             ),
@@ -224,25 +530,13 @@ export function createAgentDelivery(deps: {
         outcomes.push(
           ...ours.filter((h) => !live.includes(h)).map(() => "failed" as const),
         );
-        if (live.length === 0) return outcomes;
-        const fresh = trigger !== "connect";
-        const reads = new Map<string, Promise<PublishedClosure>>();
-        const bundleFor = (system: string) => {
-          let entry = reads.get(system);
-          if (entry === undefined) {
-            entry = readIndex(system, profile, fresh);
-            reads.set(system, entry);
-          }
-          return entry;
-        };
         outcomes.push(
-          ...(await Promise.all(
-            live.map((h) => deliverOne(h, profile, bundleFor)),
-          )),
+          ...(await Promise.all(live.map((h) => deliverOne(h, stack, run)))),
         );
+        await resolved;
         return outcomes;
       } finally {
-        for (const h of ours) inFlight.delete(`${h.key}#${profile}`);
+        for (const h of ours) inFlight.delete(slotOf(h));
       }
     },
   };

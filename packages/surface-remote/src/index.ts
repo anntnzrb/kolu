@@ -33,6 +33,7 @@ export {
 export {
   type ClosureRoute,
   closureRoute,
+  isDarwinSystem,
   type SignedBecause,
   signedBecause,
 } from "./closureRoute";
@@ -94,6 +95,9 @@ export {
   type RemotePoolOptions,
 } from "./hostFanout";
 export {
+  type DeliverClosureOptions,
+  type DeliverClosureResult,
+  deliverClosure,
   homeGcRoot,
   makeProvisionBudgets,
   makeStepBudget,

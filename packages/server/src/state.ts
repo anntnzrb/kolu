@@ -144,6 +144,65 @@ export function migratePreferences_1_40_0(
   };
 }
 
+/** 1.41.0 — agent-distro is one package, and the Agents setting's single
+ *  `profile` became `profiles`, the stack over it. On or off is kept; `null`
+ *  (never chosen) stays `null`, and a record already in the new shape is
+ *  returned untouched. `vanilla` — the one bundle kolu shipped, the harnesses
+ *  with no profile — is the empty stack; any other value was a reference, and
+ *  is the stack's one entry (Juspay's leaves it at 1.42.0). Exported for
+ *  `state.test.ts`. */
+export function migratePreferences_1_41_0(
+  current: Record<string, unknown>,
+): Record<string, unknown> {
+  const stored = current.agentDistro as
+    | { enabled: boolean; profile: string }
+    | { enabled: boolean; profiles: string[] }
+    | null
+    | undefined;
+  if (stored === null || stored === undefined || !("profile" in stored))
+    return current;
+  return {
+    ...current,
+    agentDistro: {
+      enabled: stored.enabled,
+      profiles: stored.profile === "vanilla" ? [] : [stored.profile],
+    },
+  };
+}
+
+/** 1.42.0 — Juspay is an explicit opt-in: `github:juspay/skills` leaves the
+ *  stack, and `agentProfilesRecent` (it is always the add field's first
+ *  suggestion, and never remembered). Between #2279 and #2287 it was the NEVER-CHOSEN default,
+ *  so turning the switch on stored it with nobody picking it, and nothing on
+ *  disk tells that apart from a pick — a value that may be a default never
+ *  stays an entry; one click adds it back. The setting never shipped in a
+ *  release, so only development builds wrote it. Exported for
+ *  `state.test.ts`. */
+export function migratePreferences_1_42_0(
+  current: Record<string, unknown>,
+): Record<string, unknown> {
+  const juspay = "github:juspay/skills";
+  const stored = current.agentDistro as
+    | { enabled: boolean; profiles: string[] }
+    | null
+    | undefined;
+  const recent = current.agentProfilesRecent as string[] | undefined;
+  return {
+    ...current,
+    ...(stored === null || stored === undefined
+      ? {}
+      : {
+          agentDistro: {
+            ...stored,
+            profiles: stored.profiles.filter((p) => p !== juspay),
+          },
+        }),
+    ...(recent === undefined
+      ? {}
+      : { agentProfilesRecent: recent.filter((p) => p !== juspay) }),
+  };
+}
+
 /** 1.32.0 — the new-terminal collapsed DEFAULT moved off `rightPanel.collapsed`
  *  (a write-dead seed jammed next to live geometry) to a top-level
  *  `newTerminalCollapsed` preference beside `newTerminalTheme`. CARRY the old
@@ -288,7 +347,7 @@ function readPersistedRecord(
  * Must be valid semver. `conf` runs all migration handlers
  * whose keys are > the last-seen version and ≤ this value.
  */
-const SCHEMA_VERSION = "1.40.0";
+const SCHEMA_VERSION = "1.42.0";
 
 // Callers must pass an explicit directory via KOLU_STATE_DIR. A bare launch
 // with no env would silently clobber whatever happens to live at conf's
@@ -837,6 +896,27 @@ const CONF_MIGRATIONS = {
     store.set(
       "preferences",
       migratePreferences_1_40_0(
+        store.get("preferences") as Record<string, unknown>,
+      ) as unknown as Preferences,
+    );
+  },
+  // The Agents setting's `profile` becomes `profiles`, the stack over
+  // agent-distro's one package: `vanilla` (the harnesses alone) is the empty
+  // stack, a reference its one entry.
+  "1.41.0": (store: Conf<PersistedState>) => {
+    store.set(
+      "preferences",
+      migratePreferences_1_41_0(
+        store.get("preferences") as Record<string, unknown>,
+      ) as unknown as Preferences,
+    );
+  },
+  // Juspay's reference — once the never-chosen default — leaves the stack and
+  // the remembered references: it is an explicit opt-in.
+  "1.42.0": (store: Conf<PersistedState>) => {
+    store.set(
+      "preferences",
+      migratePreferences_1_42_0(
         store.get("preferences") as Record<string, unknown>,
       ) as unknown as Preferences,
     );

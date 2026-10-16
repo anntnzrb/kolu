@@ -1,13 +1,23 @@
 /**
  * The delivery policy on fake steps and fake hosts: what each host's padi is
- * told (delivering, then landed / failed with its cause), how a run ends per
- * host, that upstream's index is read ONCE per system per run (and reused
- * within a schedule period for a host's connect, afresh for the user's check
- * and the schedule), that a profile switch is its own delivery, and that the
- * ONLY route a bundle takes is `ops.pull` of the index's content-addressed
- * path — nothing is evaluated or built (no such op exists to call).
+ * told (delivering, then landed with the package and every delivered profile,
+ * or failed with its cause), how a run ends per host, how each profile of the
+ * stack is locked, built for the host's system at the package's revision,
+ * shipped, and only then the package pulled; that a profile that will not
+ * lock, build or ship fails that host in words naming it; what Settings is
+ * told of each profile (`onResolution`); that upstream's index and each lock
+ * are read ONCE per run (and reused within a schedule period for a host's
+ * connect, afresh for the user's check and the schedule); that a build is
+ * remembered by revision, tree and system; that a stack change is its own
+ * delivery, the outdated run ending superseded; and that a re-check keeps the
+ * answers Settings already has.
  */
 
+import { referencesOf } from "@kolu/agent-distro/landing";
+import type {
+  AgentDistroSetting,
+  AgentProfiles,
+} from "@kolu/agent-distro/schema";
 import type { AgentDistroDeliveryReport } from "@kolu/agent-distro/schema";
 import type { Logger } from "@kolu/log";
 import type { PublishedClosure } from "@kolu/surface-remote";
@@ -17,6 +27,7 @@ import {
   type DeliveryHost,
   type DeliveryOps,
 } from "./delivery.ts";
+import type { BuiltProfile, LockedProfile } from "./profiles.ts";
 
 const SCHEDULE = { periodSeconds: 21600, offsetSeconds: 7200 };
 
@@ -29,48 +40,116 @@ const log = {
 
 const at = (iso: string) => Date.parse(iso);
 
-/** The index's content-addressed path for the `n`th read of a system's
- *  profile bundle. */
-const caFor = (n: number, system: string, profile: string) =>
-  `/nix/store/ca${n}-${system}-${profile}`;
+const REV = "f".repeat(40);
 
-/** Fake steps: each records its calls; `pull` answers from `result`,
- *  and can be held open with `hold`. */
+/** The index's content-addressed path for the `n`th read of a system's
+ *  package. */
+const caFor = (n: number, system: string) => `/nix/store/ca${n}-${system}`;
+
+const slug = (s: string) => s.replace(/[^a-z0-9]+/gi, "-");
+
+/** The profile's name a fake build gives it: its reference's last part. */
+const nameOf = (reference: string) => reference.split(/[/:]/).at(-1) ?? "";
+
+/** The path a fake build lands at for these inputs. */
+const builtPath = (rev: string, tree: string, system: string) =>
+  `/nix/store/built-${system}-${slug(tree)}-${rev.slice(0, 4)}`;
+
+/** The tree a fake lock pins a flake reference to (stable unless `lock` says
+ *  otherwise); a path is its own tree, with no revision. */
+const treeOf = (reference: string) =>
+  reference.startsWith("/") ? reference : `/nix/store/src-${slug(reference)}`;
+const LOCKED_REV = "a".repeat(40);
+
+/** Fake steps: each records its calls; `pull` answers from `result`, and can
+ *  be held open with `hold`. */
 function fakeOps(
   opts: {
     systems?: Record<string, string>;
     result?: () => Awaited<ReturnType<DeliveryOps["pull"]>>;
-    published?: (
-      system: string,
-      profile: string,
-    ) => PublishedClosure | Error | undefined;
+    published?: (system: string) => PublishedClosure | Error | undefined;
+    lock?: (reference: string) => LockedProfile | Error | undefined;
+    build?: (args: {
+      rev: string;
+      locked: LockedProfile;
+      hostSystem: string;
+    }) => BuiltProfile | Error | undefined;
+    ship?: (args: {
+      ssh: string;
+      reference: string;
+      path: string;
+    }) => Awaited<ReturnType<DeliveryOps["ship"]>> | undefined;
   } = {},
 ) {
   const reads: string[] = [];
-  const pulled: {
+  const locks: string[] = [];
+  const builds: { rev: string; tree: string; hostSystem: string }[] = [];
+  const shipped: {
     ssh: string;
     system: string;
-    storePath: string;
-    profile: string;
+    reference: string;
+    path: string;
   }[] = [];
+  const pulled: { ssh: string; system: string; storePath: string }[] = [];
+  /** Every step in the order it was asked, as `op:subject`. */
+  const steps: string[] = [];
   let gate: Promise<void> | undefined;
   const ops: DeliveryOps = {
     hostNixOf: async (ssh) => ({
       system: opts.systems?.[ssh] ?? "x86_64-linux",
       nixVersion: "2.34.8",
     }),
-    published: async (system, profile) => {
-      reads.push(`${system}.${profile}`);
-      const answer = opts.published?.(system, profile);
+    published: async (system) => {
+      reads.push(system);
+      const answer = opts.published?.(system);
       if (answer instanceof Error) throw answer;
-      const ca = caFor(reads.length, system, profile);
-      return answer ?? { rev: "f".repeat(40), ia: `${ca}-ia`, ca };
+      const ca = caFor(reads.length, system);
+      return answer ?? { rev: REV, ia: `${ca}-ia`, ca };
     },
-    // Which form a host runs is the ops' call (`closureRoute`, `@kolu/surface-remote`); this fake lands
-    // `ca` and records the system it was told.
-    pull: async ({ ssh, hostNix, published, profile }) => {
+    lock: async (reference) => {
+      locks.push(reference);
+      const answer = opts.lock?.(reference);
+      if (answer instanceof Error) throw answer;
+      return (
+        answer ??
+        (reference.startsWith("/")
+          ? { reference, tree: reference }
+          : { reference, tree: treeOf(reference), rev: LOCKED_REV })
+      );
+    },
+    build: async (args) => {
+      builds.push({
+        rev: args.rev,
+        tree: args.locked.tree,
+        hostSystem: args.hostSystem,
+      });
+      const answer = opts.build?.(args);
+      if (answer instanceof Error) throw answer;
+      const name = nameOf(args.locked.reference);
+      return (
+        answer ?? {
+          path: builtPath(args.rev, args.locked.tree, args.hostSystem),
+          name,
+          description: `The ${name} profile`,
+        }
+      );
+    },
+    ship: async ({ ssh, hostNix, reference, path }) => {
+      shipped.push({ ssh, system: hostNix.system, reference, path });
+      steps.push(`ship:${ssh}:${reference}`);
+      return (
+        opts.ship?.({ ssh, reference, path }) ?? {
+          ok: true,
+          path: `${path}-on-${ssh}`,
+        }
+      );
+    },
+    // Which form a host runs is the ops' call (`closureRoute`,
+    // `@kolu/surface-remote`); this fake lands `ca`.
+    pull: async ({ ssh, hostNix, published }) => {
       const storePath = published.ca ?? published.ia;
-      pulled.push({ ssh, system: hostNix.system, storePath, profile });
+      pulled.push({ ssh, system: hostNix.system, storePath });
+      steps.push(`pull:${ssh}`);
       if (gate !== undefined) await gate;
       return opts.result?.() ?? { ok: true, bundle: storePath };
     },
@@ -78,7 +157,11 @@ function fakeOps(
   return {
     ops,
     reads,
+    locks,
+    builds,
+    shipped,
     pulled,
+    steps,
     /** Hold every `pull` open until the returned release is called. */
     hold: () => {
       let release!: () => void;
@@ -109,39 +192,61 @@ function fakeHost(key: string, ssh: string, label = ssh) {
 function setup(opts: {
   ops: DeliveryOps;
   hosts: DeliveryHost[];
-  bundle?: () => string | undefined;
+  /** The setting as its stack: `undefined` is off (with an empty list). */
+  stack?: () => readonly string[] | undefined;
+  /** The whole setting, when a test needs the list while off. */
+  setting?: () => AgentDistroSetting;
   now?: () => number;
 }) {
-  return createAgentDelivery({
+  const resolutions: AgentProfiles[] = [];
+  const stack = opts.stack ?? (() => []);
+  const delivery = createAgentDelivery({
     schedule: SCHEDULE,
     ops: opts.ops,
     log,
-    bundle: opts.bundle ?? (() => "vanilla"),
+    setting:
+      opts.setting ??
+      (() => {
+        const profiles = stack();
+        return profiles === undefined
+          ? { enabled: false, profiles: [] }
+          : { enabled: true, profiles };
+      }),
     hosts: () => opts.hosts,
+    onResolution: (profiles) => {
+      resolutions.push(profiles);
+    },
     now: opts.now ?? (() => at("2026-10-08T09:00:00Z")),
   });
+  return { delivery, resolutions };
 }
 
-describe("createAgentDelivery", () => {
-  it("a landed delivery reports delivering, then landed with the index's content-addressed path", async () => {
+const JUSPAY = "github:juspay/skills";
+const MINE = "/home/me/my-profile";
+
+describe("createAgentDelivery — the package", () => {
+  it("an empty stack lands the package alone: delivering, then landed with no profile", async () => {
     const nix = fakeOps();
     const local = fakeHost("local", "localhost", "laptop");
-    const delivery = setup({ ops: nix.ops, hosts: [local.host] });
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [local.host],
+    });
     const outcomes = await delivery.run({ trigger: "user" });
-    const ca = caFor(1, "x86_64-linux", "vanilla");
+    const ca = caFor(1, "x86_64-linux");
     expect(outcomes).toEqual(["landed"]);
     expect(local.reports).toEqual([
-      { kind: "delivering", profile: "vanilla" },
-      { kind: "landed", profile: "vanilla", bundle: ca },
+      { kind: "delivering", profiles: [] },
+      { kind: "landed", set: { bundle: ca, profiles: [] } },
     ]);
     expect(nix.pulled).toEqual([
-      {
-        ssh: "localhost",
-        system: "x86_64-linux",
-        storePath: ca,
-        profile: "vanilla",
-      },
+      { ssh: "localhost", system: "x86_64-linux", storePath: ca },
     ]);
+    expect(nix.locks).toEqual([]);
+    expect(nix.builds).toEqual([]);
+    expect(nix.shipped).toEqual([]);
+    // Settings is told there is no profile to resolve.
+    expect(resolutions).toEqual([[]]);
     expect(delivery.running()).toBe(false);
   });
 
@@ -151,38 +256,54 @@ describe("createAgentDelivery", () => {
       result: () => ({ ok: true, bundle: "/nix/store/signed-ia-bundle" }),
     });
     const mac = fakeHost("remote:mac", "srid@mac", "mac");
-    const delivery = setup({ ops: nix.ops, hosts: [mac.host] });
+    const { delivery } = setup({ ops: nix.ops, hosts: [mac.host] });
     expect(await delivery.run({ trigger: "user" })).toEqual(["landed"]);
-    expect(nix.reads).toEqual(["aarch64-darwin.vanilla"]);
+    expect(nix.reads).toEqual(["aarch64-darwin"]);
     expect(nix.pulled[0]).toMatchObject({
       system: "aarch64-darwin",
-      storePath: caFor(1, "aarch64-darwin", "vanilla"),
+      storePath: caFor(1, "aarch64-darwin"),
     });
     expect(mac.reports.at(-1)).toEqual({
       kind: "landed",
-      profile: "vanilla",
-      bundle: "/nix/store/signed-ia-bundle",
+      set: { bundle: "/nix/store/signed-ia-bundle", profiles: [] },
     });
   });
 
-  it("a system upstream has not published is a typed failure, and nothing is pulled", async () => {
+  it("a system upstream has not published is a failure in its words, and nothing is pulled", async () => {
     const nix = fakeOps({
       systems: { pi: "armv7l-linux" },
-      published: (system, profile) =>
+      published: (system) =>
         new Error(
-          `agent-distro has not published the ${profile} agents for ${system} yet`,
+          `agent-distro has not published its agents for ${system} yet`,
         ),
     });
     const pi = fakeHost("remote:pi", "pi");
-    const delivery = setup({ ops: nix.ops, hosts: [pi.host] });
+    const { delivery } = setup({ ops: nix.ops, hosts: [pi.host] });
     expect(await delivery.run({ trigger: "user" })).toEqual(["failed"]);
     expect(pi.reports.at(-1)).toEqual({
       kind: "failed",
-      profile: "vanilla",
-      message:
-        "agent-distro has not published the vanilla agents for armv7l-linux yet",
+      profiles: [],
+      message: "agent-distro has not published its agents for armv7l-linux yet",
     });
     expect(nix.pulled).toEqual([]);
+  });
+
+  it("a pull that did not land is a delivery failure, in the pull's own words", async () => {
+    const nix = fakeOps({
+      result: () => ({ ok: false, message: "box: ssh dropped" }),
+    });
+    const box = fakeHost("remote:box", "box");
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [box.host],
+      stack: () => [JUSPAY],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual(["failed"]);
+    expect(box.reports.at(-1)).toEqual({
+      kind: "failed",
+      profiles: [JUSPAY],
+      message: "box: ssh dropped",
+    });
   });
 
   it("a failure is not remembered: a reconnect delivers again", async () => {
@@ -194,28 +315,284 @@ describe("createAgentDelivery", () => {
           : { ok: true, bundle: "/nix/store/landed" },
     });
     const box = fakeHost("remote:box", "box");
-    const delivery = setup({ ops: nix.ops, hosts: [box.host] });
+    const { delivery } = setup({ ops: nix.ops, hosts: [box.host] });
     expect(await delivery.run({ trigger: "user" })).toEqual(["failed"]);
     fail = false;
     expect(await delivery.run({ trigger: "connect" })).toEqual(["landed"]);
     expect(nix.pulled).toHaveLength(2);
   });
 
-  it("a pull that did not land is a delivery failure, in the pull's own words", async () => {
+  it("an index that cannot be read fails every host on that system and never pulls", async () => {
     const nix = fakeOps({
-      result: () => ({ ok: false, message: "box: ssh dropped" }),
+      published: () =>
+        new Error("agent-distro's index answered HTTP 503 for https://…"),
     });
+    const hosts = [fakeHost("local", "localhost"), fakeHost("remote:a", "a")];
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: hosts.map((h) => h.host),
+      stack: () => [JUSPAY],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual([
+      "failed",
+      "failed",
+    ]);
+    for (const h of hosts) {
+      expect(h.reports).toEqual([
+        { kind: "delivering", profiles: [JUSPAY] },
+        {
+          kind: "failed",
+          profiles: [JUSPAY],
+          message: "agent-distro's index answered HTTP 503 for https://…",
+        },
+      ]);
+    }
+    // One read for the whole run — Settings' resolution and every host share
+    // it, failed as it is, so they all see the same answer.
+    expect(nix.reads).toEqual(["x86_64-linux"]);
+    expect(nix.builds).toEqual([]);
+    expect(nix.pulled).toEqual([]);
+    // No profile can be built here, and Settings says why.
+    expect(resolutions.at(-1)).toEqual([
+      {
+        reference: JUSPAY,
+        resolution: {
+          kind: "failed",
+          message: "agent-distro's index answered HTTP 503 for https://…",
+        },
+      },
+    ]);
+  });
+
+  it("is a no-op while agents are off, and Settings is told there is nothing to resolve", async () => {
+    const nix = fakeOps();
+    const local = fakeHost("local", "localhost");
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [local.host],
+      stack: () => undefined,
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual([]);
+    await delivery.resolve();
+    expect(resolutions).toEqual([[]]);
+    expect(nix.reads).toEqual([]);
+    expect(nix.locks).toEqual([]);
+    expect(local.reports).toEqual([]);
+    expect(nix.pulled).toEqual([]);
+  });
+});
+
+describe("createAgentDelivery — the profiles", () => {
+  it("locks, builds for the host's system at the package's revision, and ships each profile in stack order — then pulls the package and reports them all", async () => {
+    const nix = fakeOps({ systems: { box: "aarch64-linux" } });
     const box = fakeHost("remote:box", "box");
-    const delivery = setup({ ops: nix.ops, hosts: [box.host] });
-    expect(await delivery.run({ trigger: "user" })).toEqual(["failed"]);
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [box.host],
+      stack: () => [JUSPAY, MINE],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual(["landed"]);
+    // Each profile is built for the host's system with agent-distro at the
+    // revision the host's package was published at.
+    expect(nix.builds).toContainEqual({
+      rev: REV,
+      tree: treeOf(JUSPAY),
+      hostSystem: "aarch64-linux",
+    });
+    expect(nix.builds).toContainEqual({
+      rev: REV,
+      tree: MINE,
+      hostSystem: "aarch64-linux",
+    });
+    // Shipped in stack order, every one before the package is pulled.
+    expect(nix.steps).toEqual([
+      `ship:box:${JUSPAY}`,
+      `ship:box:${MINE}`,
+      "pull:box",
+    ]);
+    const juspayPath = builtPath(REV, treeOf(JUSPAY), "aarch64-linux");
+    const minePath = builtPath(REV, MINE, "aarch64-linux");
+    expect(nix.shipped.map((s) => s.path)).toEqual([juspayPath, minePath]);
     expect(box.reports.at(-1)).toEqual({
-      kind: "failed",
-      profile: "vanilla",
-      message: "box: ssh dropped",
+      kind: "landed",
+      set: {
+        bundle: caFor(nix.reads.indexOf("aarch64-linux") + 1, "aarch64-linux"),
+        profiles: [
+          // The path is the one the host has (`ship`'s answer); a path
+          // reference has no revision.
+          {
+            reference: JUSPAY,
+            name: "skills",
+            rev: LOCKED_REV,
+            path: `${juspayPath}-on-box`,
+          },
+          { reference: MINE, name: "my-profile", path: `${minePath}-on-box` },
+        ],
+      },
     });
   });
 
-  it("reads the index once per distinct system in a multi-host run", async () => {
+  it("tells Settings each profile is pending, then what it resolved to — built for this machine's own system", async () => {
+    const nix = fakeOps({ systems: { mac: "aarch64-darwin" } });
+    const mac = fakeHost("remote:mac", "mac");
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [mac.host],
+      stack: () => [JUSPAY, MINE],
+    });
+    await delivery.run({ trigger: "connect" });
+    expect(resolutions[0]).toEqual([
+      { reference: JUSPAY, resolution: { kind: "pending" } },
+      { reference: MINE, resolution: { kind: "pending" } },
+    ]);
+    expect(resolutions.at(-1)).toEqual([
+      {
+        reference: JUSPAY,
+        resolution: {
+          kind: "resolved",
+          name: "skills",
+          description: "The skills profile",
+          rev: LOCKED_REV,
+        },
+      },
+      {
+        reference: MINE,
+        resolution: {
+          kind: "resolved",
+          name: "my-profile",
+          description: "The my-profile profile",
+        },
+      },
+    ]);
+    // The resolution builds for this machine (localhost: x86_64-linux), the
+    // delivery for the Mac — each system's index read once.
+    expect([...nix.reads].sort()).toEqual(["aarch64-darwin", "x86_64-linux"]);
+    expect(
+      nix.builds.filter((b) => b.hostSystem === "x86_64-linux"),
+    ).toHaveLength(2);
+    expect(
+      nix.builds.filter((b) => b.hostSystem === "aarch64-darwin"),
+    ).toHaveLength(2);
+  });
+
+  it("a profile that will not build fails that host, naming the reference — and nothing past it ships, nor is the package pulled", async () => {
+    const BAD = "github:me/broken";
+    const nix = fakeOps({
+      build: ({ locked }) =>
+        locked.reference === BAD
+          ? new Error(
+              `cannot build ${BAD} for x86_64-linux: error: attribute 'x' missing`,
+            )
+          : undefined,
+    });
+    const box = fakeHost("remote:box", "box");
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [box.host],
+      stack: () => [JUSPAY, BAD, MINE],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual(["failed"]);
+    expect(box.reports.at(-1)).toEqual({
+      kind: "failed",
+      profiles: [JUSPAY, BAD, MINE],
+      message: `the ${BAD} profile: cannot build ${BAD} for x86_64-linux: error: attribute 'x' missing`,
+    });
+    expect(nix.shipped.map((s) => s.reference)).toEqual([JUSPAY]);
+    expect(nix.pulled).toEqual([]);
+    // Settings says it under that profile alone.
+    const last = resolutions.at(-1) ?? [];
+    expect(last.map((p) => p.resolution.kind)).toEqual([
+      "resolved",
+      "failed",
+      "resolved",
+    ]);
+    expect(last[1]?.resolution).toEqual({
+      kind: "failed",
+      message: `cannot build ${BAD} for x86_64-linux: error: attribute 'x' missing`,
+    });
+  });
+
+  it("a profile that will not lock fails that host, naming the reference", async () => {
+    const nix = fakeOps({
+      lock: (reference) =>
+        reference === JUSPAY
+          ? new Error(`cannot fetch ${JUSPAY}: error: HTTP 404`)
+          : undefined,
+    });
+    const box = fakeHost("remote:box", "box");
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [box.host],
+      stack: () => [JUSPAY],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual(["failed"]);
+    expect(box.reports.at(-1)).toEqual({
+      kind: "failed",
+      profiles: [JUSPAY],
+      message: `the ${JUSPAY} profile: cannot fetch ${JUSPAY}: error: HTTP 404`,
+    });
+    expect(nix.builds).toEqual([]);
+    expect(nix.pulled).toEqual([]);
+  });
+
+  it("a profile the host will not take fails that host, naming the profile, and the package is not pulled", async () => {
+    const nix = fakeOps({
+      ship: () => ({ ok: false, message: "mac could not take /nix/store/…" }),
+    });
+    const mac = fakeHost("remote:mac", "mac");
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [mac.host],
+      stack: () => [JUSPAY],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual(["failed"]);
+    expect(mac.reports.at(-1)).toEqual({
+      kind: "failed",
+      profiles: [JUSPAY],
+      message: "the skills profile: mac could not take /nix/store/…",
+    });
+    expect(nix.pulled).toEqual([]);
+  });
+
+  it("resolve() says whether each profile builds, reusing the period's answers", async () => {
+    const nix = fakeOps();
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [],
+      stack: () => [JUSPAY],
+    });
+    await delivery.resolve();
+    expect(resolutions.at(-1)).toEqual([
+      {
+        reference: JUSPAY,
+        resolution: {
+          kind: "resolved",
+          name: "skills",
+          description: "The skills profile",
+          rev: LOCKED_REV,
+        },
+      },
+    ]);
+    await delivery.resolve();
+    expect(nix.reads).toHaveLength(1);
+    expect(nix.locks).toEqual([JUSPAY]);
+    expect(nix.builds).toHaveLength(1);
+  });
+
+  it("a run that reaches no host still tells Settings whether each profile builds", async () => {
+    const nix = fakeOps();
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [],
+      stack: () => [JUSPAY],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual([]);
+    expect(resolutions.at(-1)?.[0]?.resolution.kind).toBe("resolved");
+  });
+});
+
+describe("createAgentDelivery — reads and builds, each asked once", () => {
+  it("one run reads the index once per system and locks each reference once, across hosts and Settings' resolution", async () => {
     const nix = fakeOps({
       systems: {
         localhost: "x86_64-linux",
@@ -228,18 +605,23 @@ describe("createAgentDelivery", () => {
       fakeHost("remote:a", "a"),
       fakeHost("remote:b", "b"),
     ];
-    const delivery = setup({ ops: nix.ops, hosts: hosts.map((h) => h.host) });
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: hosts.map((h) => h.host),
+      stack: () => [JUSPAY, MINE],
+    });
     expect(await delivery.run({ trigger: "user" })).toEqual([
       "landed",
       "landed",
       "landed",
     ]);
-    expect([...nix.reads].sort()).toEqual([
-      "aarch64-darwin.vanilla",
-      "x86_64-linux.vanilla",
-    ]);
-    // `pull` is the only route a bundle takes — once per host, each with its
-    // own system's path.
+    expect([...nix.reads].sort()).toEqual(["aarch64-darwin", "x86_64-linux"]);
+    expect([...nix.locks].sort()).toEqual([JUSPAY, MINE].sort());
+    // One build per profile per system: the two Linux hosts and this
+    // machine's resolution share theirs.
+    expect(nix.builds).toHaveLength(4);
+    // Each host is shipped each profile, and pulls its own system's path.
+    expect(nix.shipped).toHaveLength(6);
     const linux = nix.pulled.find((p) => p.ssh === "a")?.storePath;
     expect(nix.pulled.find((p) => p.ssh === "localhost")?.storePath).toBe(
       linux,
@@ -249,64 +631,47 @@ describe("createAgentDelivery", () => {
     );
   });
 
-  it("reuses the period's index answer for a connect, reads afresh for the user and the schedule, and re-reads in the next period", async () => {
+  it("a connect reuses the period's index and locks; the user and the schedule read afresh; the next period re-reads", async () => {
     const nix = fakeOps();
     const local = fakeHost("local", "localhost");
     let now = at("2026-10-08T09:00:00Z");
-    const delivery = setup({
+    const { delivery } = setup({
       ops: nix.ops,
       hosts: [local.host],
+      stack: () => [JUSPAY],
       now: () => now,
     });
     await delivery.run({ trigger: "connect" });
     expect(nix.reads).toHaveLength(1);
-    // Same period (08:00–14:00 UTC): a reconnect reuses the answer.
+    expect(nix.locks).toHaveLength(1);
+    // Same period (08:00–14:00 UTC): a reconnect reuses both answers.
     now = at("2026-10-08T13:00:00Z");
     await delivery.run({ trigger: "connect" });
     expect(nix.reads).toHaveLength(1);
-    // The user's check reads afresh.
+    expect(nix.locks).toHaveLength(1);
+    // The user's check reads and locks afresh.
     await delivery.run({ trigger: "user" });
     expect(nix.reads).toHaveLength(2);
+    expect(nix.locks).toHaveLength(2);
     // Past the 14:00 boundary, even a reconnect re-reads.
     now = at("2026-10-08T14:01:00Z");
     await delivery.run({ trigger: "connect" });
     expect(nix.reads).toHaveLength(3);
-    // The schedule reads afresh too.
+    expect(nix.locks).toHaveLength(3);
+    // The schedule reads afresh too — even within the period, an answer asked
+    // before it started is not its own.
+    now = at("2026-10-08T14:02:00Z");
     await delivery.run({ trigger: "schedule" });
     expect(nix.reads).toHaveLength(4);
+    expect(nix.locks).toHaveLength(4);
     // Each landing is the path its run's answer named.
     expect(nix.pulled.map((p) => p.storePath)).toEqual([
-      caFor(1, "x86_64-linux", "vanilla"),
-      caFor(1, "x86_64-linux", "vanilla"),
-      caFor(2, "x86_64-linux", "vanilla"),
-      caFor(3, "x86_64-linux", "vanilla"),
-      caFor(4, "x86_64-linux", "vanilla"),
+      caFor(1, "x86_64-linux"),
+      caFor(1, "x86_64-linux"),
+      caFor(2, "x86_64-linux"),
+      caFor(3, "x86_64-linux"),
+      caFor(4, "x86_64-linux"),
     ]);
-  });
-
-  it("an index that cannot be read fails every host on that system and never pulls", async () => {
-    const nix = fakeOps({
-      published: () =>
-        new Error("agent-distro's index answered HTTP 503 for https://…"),
-    });
-    const hosts = [fakeHost("local", "localhost"), fakeHost("remote:a", "a")];
-    const delivery = setup({ ops: nix.ops, hosts: hosts.map((h) => h.host) });
-    expect(await delivery.run({ trigger: "user" })).toEqual([
-      "failed",
-      "failed",
-    ]);
-    for (const h of hosts) {
-      expect(h.reports).toEqual([
-        { kind: "delivering", profile: "vanilla" },
-        {
-          kind: "failed",
-          profile: "vanilla",
-          message: "agent-distro's index answered HTTP 503 for https://…",
-        },
-      ]);
-    }
-    expect(nix.reads).toHaveLength(1);
-    expect(nix.pulled).toEqual([]);
   });
 
   it("a failed read is not reused: the next connect reads again", async () => {
@@ -315,32 +680,203 @@ describe("createAgentDelivery", () => {
       published: () => (down ? new Error("HTTP 503") : undefined),
     });
     const local = fakeHost("local", "localhost");
-    const delivery = setup({ ops: nix.ops, hosts: [local.host] });
+    const { delivery } = setup({ ops: nix.ops, hosts: [local.host] });
     expect(await delivery.run({ trigger: "connect" })).toEqual(["failed"]);
     down = false;
     expect(await delivery.run({ trigger: "connect" })).toEqual(["landed"]);
     expect(nix.reads).toHaveLength(2);
   });
 
-  it("is a no-op while agents are off", async () => {
-    const nix = fakeOps();
+  it("a build is reused like the index and locks: a connect within the period builds nothing, a check rebuilds — an edited path profile is picked up", async () => {
+    let tree = "/nix/store/src-one";
+    let rev = REV;
+    let now = at("2026-10-08T09:00:00Z");
+    const nix = fakeOps({
+      lock: (reference) => ({ reference, tree, rev: LOCKED_REV }),
+      published: () => ({ rev, ia: "/nix/store/pkg-ia", ca: "/nix/store/pkg" }),
+    });
     const local = fakeHost("local", "localhost");
-    const delivery = setup({
+    const { delivery } = setup({
       ops: nix.ops,
       hosts: [local.host],
-      bundle: () => undefined,
+      stack: () => [JUSPAY],
+      now: () => now,
     });
-    expect(await delivery.run({ trigger: "user" })).toEqual([]);
-    expect(nix.reads).toEqual([]);
-    expect(local.reports).toEqual([]);
-    expect(nix.pulled).toEqual([]);
+    await delivery.run({ trigger: "connect" });
+    expect(nix.builds).toEqual([
+      { rev: REV, tree: "/nix/store/src-one", hostSystem: "x86_64-linux" },
+    ]);
+    // A reconnect in the same period reuses the build (and the lock).
+    now = at("2026-10-08T13:00:00Z");
+    await delivery.run({ trigger: "connect" });
+    expect(nix.builds).toHaveLength(1);
+    // The user's check builds again, whatever the tree: a path profile's tree
+    // is a directory that changes under the same key.
+    await delivery.run({ trigger: "user" });
+    expect(nix.builds).toHaveLength(2);
+    // A new tree or a new package revision is a new build too.
+    tree = "/nix/store/src-two";
+    rev = "e".repeat(40);
+    now = at("2026-10-08T14:01:00Z");
+    await delivery.run({ trigger: "connect" });
+    expect(nix.builds.at(-1)).toEqual({
+      rev,
+      tree: "/nix/store/src-two",
+      hostSystem: "x86_64-linux",
+    });
+    expect(nix.builds).toHaveLength(3);
   });
 
+  it("two runs that overlap (one per host's connect) share one build, one lock and one read", async () => {
+    const nix = fakeOps();
+    const local = fakeHost("local", "localhost");
+    const box = fakeHost("remote:box", "box");
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [local.host, box.host],
+      stack: () => [JUSPAY],
+    });
+    await Promise.all([
+      delivery.run({ keys: ["local"], trigger: "connect" }),
+      delivery.run({ keys: ["remote:box"], trigger: "connect" }),
+    ]);
+    expect(nix.reads).toHaveLength(1);
+    expect(nix.locks).toHaveLength(1);
+    expect(nix.builds).toHaveLength(1);
+  });
+
+  it("a failed build is asked again next time", async () => {
+    let broken = true;
+    const nix = fakeOps({
+      build: () => (broken ? new Error("cannot build: network") : undefined),
+    });
+    const local = fakeHost("local", "localhost");
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [local.host],
+      stack: () => [JUSPAY],
+    });
+    expect(await delivery.run({ trigger: "connect" })).toEqual(["failed"]);
+    const failedBuilds = nix.builds.length;
+    broken = false;
+    expect(await delivery.run({ trigger: "connect" })).toEqual(["landed"]);
+    expect(nix.builds.length).toBeGreaterThan(failedBuilds);
+    // A build that succeeded is reused within the period: a third connect
+    // builds nothing.
+    const built = nix.builds.length;
+    await delivery.run({ trigger: "connect" });
+    expect(nix.builds).toHaveLength(built);
+  });
+});
+
+describe("createAgentDelivery — a re-check keeps what Settings knows", () => {
+  it("a profile that built shows its answer while a fresh run asks again — never `pending` again", async () => {
+    const nix = fakeOps();
+    const local = fakeHost("local", "localhost");
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [local.host],
+      stack: () => [JUSPAY],
+    });
+    expect(await delivery.run({ trigger: "user" })).toEqual(["landed"]);
+    expect(resolutions[0]).toEqual([
+      { reference: JUSPAY, resolution: { kind: "pending" } },
+    ]);
+    const answered = resolutions.at(-1);
+    expect(answered?.[0]?.resolution.kind).toBe("resolved");
+    const before = resolutions.length;
+    // The schedule's run asks afresh: every publish it makes says resolved.
+    expect(await delivery.run({ trigger: "schedule" })).toEqual(["landed"]);
+    const again = resolutions.slice(before);
+    expect(again.length).toBeGreaterThan(0);
+    for (const profiles of again)
+      expect(profiles[0]?.resolution.kind).toBe("resolved");
+  });
+});
+
+describe("createAgentDelivery — an outdated run's answers", () => {
+  it("are neither shown nor remembered: a later re-check opens with the newer answer, not the outdated failure", async () => {
+    const nix = fakeOps();
+    let profiles: readonly string[] = [JUSPAY];
+    // The first lock of Juspay is held, then fails; every later one locks.
+    let failFirst!: (err: Error) => void;
+    let first = true;
+    const ops: DeliveryOps = {
+      ...nix.ops,
+      lock: (reference) => {
+        if (reference === JUSPAY && first) {
+          first = false;
+          return new Promise((_, reject) => {
+            failFirst = reject;
+          });
+        }
+        return nix.ops.lock(reference);
+      },
+    };
+    const { delivery, resolutions } = setup({
+      ops,
+      hosts: [],
+      stack: () => profiles,
+    });
+    const outdated = delivery.run({ trigger: "user" });
+    await vi.waitFor(() => expect(failFirst).toBeDefined());
+    profiles = [JUSPAY, MINE];
+    await delivery.run({ trigger: "user" });
+    const juspayIn = (p: AgentProfiles | undefined) =>
+      p?.find((e) => e.reference === JUSPAY)?.resolution.kind;
+    expect(juspayIn(resolutions.at(-1))).toBe("resolved");
+    const shown = resolutions.length;
+    failFirst(new Error("network went away"));
+    await outdated;
+    // The outdated run's failure is not shown…
+    expect(resolutions).toHaveLength(shown);
+    // …nor remembered: the next re-check opens with the newer answer.
+    await delivery.run({ trigger: "schedule" });
+    expect(juspayIn(resolutions[shown])).toBe("resolved");
+  });
+});
+
+describe("createAgentDelivery — the switch going off", () => {
+  it("empties Settings' answers, and a check still settling then publishes nothing", async () => {
+    const nix = fakeOps();
+    let setting: AgentDistroSetting = { enabled: true, profiles: [JUSPAY] };
+    let failLock!: (err: Error) => void;
+    const ops: DeliveryOps = {
+      ...nix.ops,
+      lock: () =>
+        new Promise((_, reject) => {
+          failLock = reject;
+        }),
+    };
+    const { delivery, resolutions } = setup({
+      ops,
+      hosts: [],
+      setting: () => setting,
+    });
+    const check = delivery.run({ trigger: "user" });
+    await vi.waitFor(() => expect(failLock).toBeDefined());
+    // Off, mid-check: the cell empties (the list is kept)…
+    setting = { enabled: false, profiles: [JUSPAY] };
+    await delivery.resolve();
+    expect(resolutions.at(-1)).toEqual([]);
+    const shown = resolutions.length;
+    // …and the check settling now — here with a failure — publishes nothing:
+    // no red line under a list the user switched off.
+    failLock(new Error("network went away"));
+    await check;
+    expect(resolutions).toHaveLength(shown);
+  });
+});
+
+describe("createAgentDelivery — hosts and runs", () => {
   it("a host already being delivered to is busy, and keeps its delivery", async () => {
     const nix = fakeOps();
     const local = fakeHost("local", "localhost");
     const box = fakeHost("remote:box", "box");
-    const delivery = setup({ ops: nix.ops, hosts: [local.host, box.host] });
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [local.host, box.host],
+    });
     const release = nix.hold();
     const first = delivery.run({ keys: ["local"], trigger: "user" });
     await vi.waitFor(() => expect(nix.pulled).toHaveLength(1));
@@ -356,11 +892,63 @@ describe("createAgentDelivery", () => {
     expect(delivery.running()).toBe(false);
   });
 
+  it("a run whose profile list changed while it ran is superseded: no landing, only the report padi drops, nothing for Settings", async () => {
+    const nix = fakeOps();
+    const local = fakeHost("local", "localhost");
+    let stack: readonly string[] = [];
+    const { delivery, resolutions } = setup({
+      ops: nix.ops,
+      hosts: [local.host],
+      stack: () => stack,
+    });
+    const release = nix.hold();
+    // The switch turned on with an empty list; its run is pulling the package
+    // when Juspay is added.
+    const stale = delivery.run({ trigger: "user" });
+    await vi.waitFor(() => expect(nix.pulled).toHaveLength(1));
+    stack = [JUSPAY];
+    const published = resolutions.length;
+    release();
+    expect(await stale).toEqual(["superseded"]);
+    // padi would refuse a landing for [] now: none is reported. Its one
+    // closing report is `failed` for [] — which padi drops silently for a
+    // list the setting has left, ending its `delivering` record for [].
+    expect(local.reports.map((r) => r.kind)).toEqual(["delivering", "failed"]);
+    expect(local.reports.at(-1)).toMatchObject({
+      kind: "failed",
+      profiles: [],
+    });
+    expect(resolutions).toHaveLength(published);
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it("the switch going off mid-delivery supersedes nothing: the set lands, as padi takes it", async () => {
+    const nix = fakeOps();
+    const local = fakeHost("local", "localhost");
+    let setting: AgentDistroSetting = { enabled: true, profiles: [JUSPAY] };
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [local.host],
+      setting: () => setting,
+    });
+    const release = nix.hold();
+    const run = delivery.run({ trigger: "user" });
+    await vi.waitFor(() => expect(nix.pulled).toHaveLength(1));
+    // Off keeps the list; padi judges a landing by the list alone.
+    setting = { enabled: false, profiles: [JUSPAY] };
+    release();
+    expect(await run).toEqual(["landed"]);
+    expect(local.reports.map((r) => r.kind)).toEqual(["delivering", "landed"]);
+  });
+
   it("delivers only to the asked keys", async () => {
     const nix = fakeOps();
     const local = fakeHost("local", "localhost");
     const box = fakeHost("remote:box", "box");
-    const delivery = setup({ ops: nix.ops, hosts: [local.host, box.host] });
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [local.host, box.host],
+    });
     expect(
       await delivery.run({ keys: ["remote:box"], trigger: "user" }),
     ).toEqual(["landed"]);
@@ -377,42 +965,51 @@ describe("createAgentDelivery", () => {
       label: "gone",
       report: () => Promise.reject(new Error("padi on gone is not connected")),
     };
-    const delivery = setup({ ops: nix.ops, hosts: [gone, local.host] });
+    const { delivery } = setup({
+      ops: nix.ops,
+      hosts: [gone, local.host],
+      stack: () => [JUSPAY],
+    });
     expect(await delivery.run({ trigger: "user" })).toEqual([
       "failed",
       "landed",
     ]);
     expect(nix.pulled.map((d) => d.ssh)).toEqual(["localhost"]);
+    expect(nix.shipped.map((d) => d.ssh)).toEqual(["localhost"]);
   });
 
-  it("a profile switch mid-delivery is its own delivery, not busy", async () => {
+  it("a stack change mid-delivery is its own delivery, not busy", async () => {
     const nix = fakeOps();
     const box = fakeHost("remote:box", "box");
-    let profile = "vanilla";
-    const delivery = setup({
+    let stack: readonly string[] = [];
+    const { delivery } = setup({
       ops: nix.ops,
       hosts: [box.host],
-      bundle: () => profile,
+      stack: () => stack,
     });
     const release = nix.hold();
     const first = delivery.run({ trigger: "connect" });
     await vi.waitFor(() => expect(nix.pulled).toHaveLength(1));
-    profile = "pro";
+    stack = [JUSPAY];
     const second = delivery.run({ trigger: "connect" });
     await vi.waitFor(() => expect(nix.pulled).toHaveLength(2));
     release();
-    expect(await first).toEqual(["landed"]);
+    // The first run's stack is no longer the setting's: superseded, its
+    // landing never reported (padi would refuse it).
+    expect(await first).toEqual(["superseded"]);
     expect(await second).toEqual(["landed"]);
-    expect(nix.pulled.map((d) => d.profile)).toEqual(["vanilla", "pro"]);
-    // Each delivery told its own profile's story.
-    const story = (p: string) =>
-      box.reports.filter((r) => r.profile === p).map((r) => r.kind);
-    expect(story("vanilla")).toEqual(["delivering", "landed"]);
-    expect(story("pro")).toEqual(["delivering", "landed"]);
-    expect(box.reports).toContainEqual({
+    // Each delivery told its own stack's story.
+    const stackOf = (r: AgentDistroDeliveryReport) =>
+      r.kind === "landed" ? referencesOf(r.set.profiles) : r.profiles;
+    const story = (s: readonly string[]) =>
+      box.reports
+        .filter((r) => JSON.stringify(stackOf(r)) === JSON.stringify(s))
+        .map((r) => r.kind);
+    expect(story([])).toEqual(["delivering", "failed"]);
+    expect(story([JUSPAY])).toEqual(["delivering", "landed"]);
+    expect(box.reports.at(-1)).toMatchObject({
       kind: "landed",
-      profile: "pro",
-      bundle: caFor(2, "x86_64-linux", "pro"),
+      set: { profiles: [{ reference: JUSPAY, name: "skills" }] },
     });
     expect(delivery.running()).toBe(false);
   });

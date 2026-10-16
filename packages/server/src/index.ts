@@ -60,7 +60,10 @@ import { log } from "./log.ts";
 import { enumerateDaemonInventoryOnce } from "./padi/daemonInventory.ts";
 import { readAgentDistroListing } from "./agentDistroListing.ts";
 import { readAgentDistroDeliveryBake } from "./agentDelivery/bake.ts";
-import { installAgentDelivery } from "./agentDelivery/install.ts";
+import {
+  type AgentDeliveryHandle,
+  installAgentDelivery,
+} from "./agentDelivery/install.ts";
 import { entryDispatch } from "./padi/entryDispatch.ts";
 import { installNewTerminalPolicyPusher } from "./padi/newTerminalPolicy.ts";
 import { installPadiCellPusher } from "./padi/padiCellPusher.ts";
@@ -795,42 +798,38 @@ export async function bootKoluWeb(flags: KoluBootFlags): Promise<void> {
     getPolicy: currentNewTerminalPolicy,
     log,
   });
-  // AGENT DELIVERY — kolu-server delivers agent-distro's bundles to every host
-  // (`./agentDelivery/`): on upstream's schedule, on the user's check, and to a
+  // AGENT DELIVERY — kolu-server delivers agent-distro's package, and the
+  // profiles of the Agents setting it builds, to every host (`./agentDelivery/`): on upstream's schedule, on the user's check, and to a
   // host the moment its padi takes the Agents setting (the pusher below). Read
   // once, here: a broken listing or delivery bake crashes the boot; a kolu built
   // from source has no delivery bake and delivers nothing (its hosts read
   // `undelivered`).
   const agentDistroListing = readAgentDistroListing();
   const deliveryBake = readAgentDistroDeliveryBake();
-  const agentDelivery =
-    deliveryBake === null
-      ? undefined
-      : installAgentDelivery({
-          bake: deliveryBake,
-          pool,
-          setting: currentAgentDistroSetting,
-          bundles: new Set(
-            agentDistroListing.kind === "available"
-              ? agentDistroListing.profiles.map((p) => p.name)
-              : [],
-          ),
-          label: (host) =>
-            host.kind === "local" ? serverHostname : host.target,
-          log,
-        });
+  // The delivery itself is installed BELOW, once kolu's surface — whose
+  // `agentProfiles` cell it writes — is served: installing it delivers at once
+  // (the schedule's first tick runs on install, and publishes). Nothing between
+  // here and there calls it: the closures that do (the pusher's `onPushed`, the
+  // surface's setting and check hooks) run on a padi connect or a user's act,
+  // and the boot invariant below proves no padi is connected yet. A call
+  // before the install anyway is a boot-order bug, and throws.
+  let installedAgentDelivery: AgentDeliveryHandle | undefined;
+  const agentDelivery = (): AgentDeliveryHandle | undefined => {
+    if (deliveryBake !== null && installedAgentDelivery === undefined)
+      throw new Error("the agent delivery was called before it was installed");
+    return installedAgentDelivery;
+  };
   // The AGENTS SETTING pusher — the same mechanism, for padi's memory-only
   // `agentDistro` cell: every bound padi (local and every remote host) learns the
   // user's choice on each connect edge and on every preferences write, and applies
-  // it to its next new terminal. A padi that does not know the chosen profile
-  // refuses the write; the pusher logs that at error. A host that TOOK the
-  // setting is delivered its bundle.
+  // it to its next new terminal. A host that TOOK the setting is delivered its
+  // set.
   const agentDistroPusher = installPadiCellPusher({
     cell: "agentDistro",
     pool,
     getValue: currentAgentDistroSetting,
     equals: agentDistroSettingEqual,
-    onPushed: (host) => agentDelivery?.deliverTo(host),
+    onPushed: (host) => agentDelivery()?.deliverTo(host),
     log,
   });
 
@@ -892,15 +891,27 @@ export async function bootKoluWeb(flags: KoluBootFlags): Promise<void> {
     onPolicyInputsChanged: () => newTerminalPolicyPusher.republish(),
     onAgentDistroChanged: () => {
       agentDistroPusher.republish();
-      agentDelivery?.onSettingChanged();
+      agentDelivery()?.onSettingChanged();
     },
-    deliverAgents: (host) => agentDelivery?.deliverNow(host),
+    deliverAgents: (host) => agentDelivery()?.deliverNow(host),
     // Read once, above: a baked floor that does not describe itself is a broken
     // build and crashes the boot; an unbaked (from-source) kolu reads
     // `unavailable`. A profile kolu cannot describe in plain words crashes the
     // boot too.
     agentDistroListing,
   });
+  installedAgentDelivery =
+    deliveryBake === null
+      ? undefined
+      : installAgentDelivery({
+          bake: deliveryBake,
+          pool,
+          setting: currentAgentDistroSetting,
+          publishProfiles: koluServed.setAgentProfiles,
+          label: (host) =>
+            host.kind === "local" ? serverHostname : host.target,
+          log,
+        });
 
   // The ROOT procedures — kolu-server's own seven, bound as the third served
   // fragment. There is no router SPLICE any more: the wire namespace is flat, so the

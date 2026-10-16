@@ -3,50 +3,54 @@
  * accepts, what it reports, and what a delivery means here. Its volatility is
  * kolu's own product decisions; the facts it acts on live in their own modules:
  *
- *   - `./bake.ts` — what this build was baked with (profiles, floor, plugins);
- *   - `./onHost.ts` — where agent-distro's bundles are on this host;
- *   - `./layer.ts` — the layer a bundle on disk gives, and its record stamp;
+ *   - `./bake.ts` — what this build was baked with (state, floor, plugins);
+ *   - `./onHost.ts` — the set this host serves;
+ *   - `./layer.ts` — the layer a set gives, and its record stamp;
  *   - `./deliveries.ts` — what kolu-server has told this host about delivering
- *     it bundles, and landing one (`current` flipped, upstream's files written);
- *   - `./receipt.ts` — what upstream's files on the host say about deliveries.
+ *     it the setting's set, and landing one (`current` flipped, the set
+ *     recorded, upstream's files written);
+ *   - `./receipt.ts` — what the files on the host say about deliveries.
  *
  * kolu-server pushes the user's setting into the memory-only `agentDistro` cell
  * (the `newTerminalPolicy` pattern: re-pushed on every connect, so padi keeps no
- * copy of a preference), and DELIVERS the setting's bundle — it fetches,
- * copies and roots it on its own schedule and reports each step through
- * `agentDistro.report` ({@link onAgentDistroReport}). padi never fetches,
- * builds or retries anything: a host needs neither flakes, GitHub, nor `nix` on
- * padi's PATH for its agents. This module keeps the read-only cells true:
- * `agentDistroStatus` (what a new terminal gets here), `agentDistroReceipt`
- * (what landed, and the last delivery that did not) and `agentDistroResolved`.
+ * copy of a preference), and DELIVERS the setting's set — agent-distro's
+ * package and the profiles it builds — on its own schedule, reporting each
+ * step through `agentDistro.report` ({@link onAgentDistroReport}). padi never
+ * fetches, builds or retries anything: a host needs neither flakes, GitHub,
+ * nor `nix` on padi's PATH for its agents. This module keeps the read-only
+ * cells true: `agentDistroStatus` (what a new terminal gets here) and
+ * `agentDistroReceipt` (what landed, and the last delivery that did not).
  *
- * A bundle that serves keeps serving while a newer one is delivered and after
- * a delivery that fails: only a host with nothing to serve reports the failure
- * as its status.
+ * A set serves new terminals only while it is the setting's stack: a changed
+ * list waits for its own set (no terminal starts without a profile the setting
+ * names). A set that serves keeps serving while a newer one for the same stack
+ * is delivered and after a delivery that fails: only a host with nothing to
+ * serve reports the failure as its status.
  */
 
-import { log } from "../log.ts";
+import { referencesOf, sameStack } from "@kolu/agent-distro/landing";
 import {
   type AgentDistroDeliveryReport,
   type AgentDistroSetting,
   type AgentDistroStatus,
-  bundleProfileOf,
   DEFAULT_AGENT_DISTRO_SETTING,
   EMPTY_AGENT_DISTRO_RECEIPT,
 } from "@kolu/agent-distro/schema";
 import { type CellStore, inMemoryStore } from "@kolu/surface/server";
+import { log } from "../log.ts";
 import { padiSurfaceCtx } from "../padiSurfaceCtx.ts";
 import { agentDistroBake } from "./bake.ts";
 import {
+  deliveryDropped,
   deliveryFailed,
   deliveryOf,
   deliveryStarted,
   landDelivery,
-  unlandedRunOf,
+  lastFailureOf,
+  pruneGcRoots,
 } from "./deliveries.ts";
-import { resolveProfileOnHost } from "./inEffect.ts";
-import { type AgentLayer, layerOnHost } from "./layer.ts";
-import { bundleOnHost } from "./onHost.ts";
+import type { AgentLayer } from "./layer.ts";
+import { servedSetOnHost } from "./onHost.ts";
 import { readReceipt } from "./receipt.ts";
 
 /** The backing store of the `agentDistro` cell, shared by the cell declaration
@@ -55,36 +59,19 @@ import { readReceipt } from "./receipt.ts";
 export const agentDistroSettingStore: CellStore<AgentDistroSetting> =
   inMemoryStore(DEFAULT_AGENT_DISTRO_SETTING);
 
-/** The bundle `profile` rides on this host ({@link bundleProfileOf} against
- *  the bake's bundles; every name rides the vanilla one on an unbaked padi,
- *  which has none to look up). */
-function bundleName(profile: string): string {
-  return bundleProfileOf(profile, agentDistroBake()?.profiles ?? new Set());
-}
-
-/** Publish what this host keeps of `setting`'s profile's deliveries —
- *  readable with agents off too (the profile the setting still names).
- *  Nothing to say on an unbaked padi or before the first push (no profile). */
+/** Publish what this host keeps of its deliveries for `setting` — readable
+ *  with agents off too. Nothing to say on an unbaked padi. */
 function publishReceipt(setting: AgentDistroSetting): void {
   const bake = agentDistroBake();
-  const profile = bake?.profiles.get(bundleName(setting.profile));
-  if (bake === null || profile === undefined) {
-    padiSurfaceCtx.cells.agentDistroReceipt.set({
-      ...EMPTY_AGENT_DISTRO_RECEIPT,
-      profile: setting.profile,
-    });
-    return;
-  }
-  // Named for the setting's profile — a reference's receipt is its bundle's —
-  // so a reader pairs it with the setting it is about.
-  padiSurfaceCtx.cells.agentDistroReceipt.set({
-    ...readReceipt(
-      profile,
-      bundleOnHost(bake, profile),
-      unlandedRunOf(profile.name),
-    ),
-    profile: setting.profile,
-  });
+  padiSurfaceCtx.cells.agentDistroReceipt.set(
+    bake === null
+      ? EMPTY_AGENT_DISTRO_RECEIPT
+      : readReceipt(
+          bake,
+          servedSetOnHost(bake),
+          lastFailureOf(setting.profiles),
+        ),
+  );
 }
 
 /** {@link publishReceipt}, never thrown into a caller that cannot act on it:
@@ -98,7 +85,6 @@ function publishReceiptLoud(setting: AgentDistroSetting): void {
     log.error({ err }, "agent-distro receipt could not be read");
     padiSurfaceCtx.cells.agentDistroReceipt.set({
       ...EMPTY_AGENT_DISTRO_RECEIPT,
-      profile: setting.profile,
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -106,40 +92,52 @@ function publishReceiptLoud(setting: AgentDistroSetting): void {
 
 /** Where `setting` stands on this host, as of now, without side effects — the
  *  ONE answer to "what does a new terminal get here": the published status is
- *  this with the layer reduced to its profile and bundle, and the spawn path
+ *  this with the layer reduced to its package and profiles, and the spawn path
  *  stamps this layer ({@link newTerminalLayer}). So a host never reads one
- *  thing while its new terminals get another. */
+ *  thing while its new terminals get another. A set on record that this host
+ *  cannot hold is an `error`, in padi's words — never a half set served. */
 export function assessAgentDistro(setting: AgentDistroSetting):
   | Exclude<AgentDistroStatus, { kind: "ready" }>
   | {
       readonly kind: "ready";
       readonly layer: AgentLayer;
-      /** A newer bundle is being delivered; `layer` keeps serving until it
-       *  lands. */
+      /** A newer set for the same stack is being delivered; `layer` keeps
+       *  serving until it lands. */
       readonly delivering: boolean;
     } {
   if (!setting.enabled) return { kind: "off" };
-  if (agentDistroBake() === null) return { kind: "unavailable" };
-  const delivery = deliveryOf(bundleName(setting.profile));
-  const layer = layerOnHost(setting);
-  if (layer !== undefined)
+  const bake = agentDistroBake();
+  if (bake === null) return { kind: "unavailable" };
+  const { profiles } = setting;
+  let served: ReturnType<typeof servedSetOnHost>;
+  try {
+    served = servedSetOnHost(bake);
+  } catch (err) {
+    log.error({ err }, "agent-distro set on this host could not be read");
+    return {
+      kind: "error",
+      profiles,
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+  const delivery = deliveryOf(profiles);
+  if (
+    served !== undefined &&
+    sameStack(referencesOf(served.profiles), profiles)
+  )
     return {
       kind: "ready",
-      layer,
+      layer: { ...served, plugins: bake.plugins },
       delivering: delivery?.kind === "delivering",
     };
   if (delivery?.kind === "failed")
-    return {
-      kind: "error",
-      profile: setting.profile,
-      message: delivery.failure.message,
-    };
-  // Nothing serves and nothing failed: `downloading` only once kolu-server has
-  // SAID it is delivering — never inferred from silence, which is also what a
-  // kolu-server that cannot deliver at all sends.
+    return { kind: "error", profiles, message: delivery.failure.words };
+  // Nothing serves this stack and nothing failed: `downloading` only once
+  // kolu-server has SAID it is delivering — never inferred from silence, which
+  // is also what a kolu-server that cannot deliver at all sends.
   return {
     kind: delivery?.kind === "delivering" ? "downloading" : "undelivered",
-    profile: setting.profile,
+    profiles,
   };
 }
 
@@ -150,52 +148,21 @@ export function newTerminalLayer(): AgentLayer | undefined {
   return assessed.kind === "ready" ? assessed.layer : undefined;
 }
 
-/** Publish `setting`'s status on this host, and keep its resolved cell about
- *  it. */
+/** Publish `setting`'s status on this host. */
 function settle(setting: AgentDistroSetting): void {
   const assessed = assessAgentDistro(setting);
-  resolveSettingOnHost(
-    setting,
-    assessed.kind === "ready" ? assessed.layer.bundle : undefined,
-  );
   padiSurfaceCtx.cells.agentDistroStatus.set(
     assessed.kind === "ready"
       ? {
           kind: "ready",
-          profile: assessed.layer.profile,
-          bundle: assessed.layer.bundle,
+          set: {
+            bundle: assessed.layer.bundle,
+            profiles: assessed.layer.profiles,
+          },
           delivering: assessed.delivering,
         }
       : assessed,
   );
-}
-
-/** The current ask of the `agentDistroResolved` cell — an answer publishes
- *  only while its ask (by identity) is still the current one. */
-let resolveAsk: { readonly profile: string } | undefined;
-
-/** Keep the `agentDistroResolved` cell about `setting`: `none` while there is
- *  nothing to ask (agents off, or no bundle serving yet — `bundle` undefined);
- *  once a bundle serves, ask agent-distro ONCE per setting whether its profile
- *  resolves (`pending` until it answers). Turning agents off and on asks
- *  again — the retry for a profile that did not resolve. */
-function resolveSettingOnHost(
-  setting: AgentDistroSetting,
-  bundle: string | undefined,
-): void {
-  const cell = padiSurfaceCtx.cells.agentDistroResolved;
-  if (!setting.enabled || bundle === undefined) {
-    resolveAsk = undefined;
-    cell.set({ kind: "none" });
-    return;
-  }
-  if (resolveAsk?.profile === setting.profile) return;
-  const ask = { profile: setting.profile };
-  resolveAsk = ask;
-  cell.set({ kind: "pending", profile: ask.profile });
-  void resolveProfileOnHost({ bundle, profile: ask.profile }).then((answer) => {
-    if (resolveAsk === ask) cell.set(answer);
-  });
 }
 
 /** The `agentDistro` cell's `onWrite`: a CHANGED setting (the cell's `equals`
@@ -207,41 +174,61 @@ export function onAgentDistroSettingWrite(next: AgentDistroSetting): void {
 }
 
 /** `agentDistro.report`: kolu-server's word on a delivery to this host. A
- *  landing points the profile's `current` at the bundle; if that cannot be
- *  done here (the bundle is not on this host, the state dir will not write) it
+ *  landing records the set and points `current` at its package; if that cannot
+ *  be done here (a path is not on this host, the state dir will not write) it
  *  is this host's failure, recorded in padi's words AND thrown back, so
- *  kolu-server's log has it too. Re-publishes the receipt first, then the
- *  status — so a client that sees the new bundle can already read what
- *  changed. Throws on a profile this padi does not know: a binder and a padi
- *  that disagree on the listing is a broken pair, not a state to degrade to. */
+ *  kolu-server's log has it too. A landing or a failure of a stack the
+ *  setting has since left (a delivery that ran while the list changed) is
+ *  refused or dropped: it never replaces, or marks, the set the current stack
+ *  serves. Re-publishes the receipt first, then the
+ *  status — so a client that sees the new set can already read what
+ *  changed. */
 export function onAgentDistroReport(report: AgentDistroDeliveryReport): void {
   const bake = agentDistroBake();
   if (bake === null)
     throw new Error(
       "kolu-server reported an agent-distro delivery, but this padi has no agent-distro bake",
     );
-  const profile = bake.profiles.get(report.profile);
-  if (profile === undefined)
-    throw new Error(
-      `kolu-server reported a delivery of '${report.profile}', which this padi's profiles listing does not name`,
-    );
+  const stack =
+    report.kind === "landed"
+      ? referencesOf(report.set.profiles)
+      : report.profiles;
   try {
     switch (report.kind) {
       case "delivering":
-        deliveryStarted(profile.name);
+        deliveryStarted(stack);
         return;
       case "failed":
-        deliveryFailed(profile.name, { message: report.message });
+        // A stack the setting has left failing is no failure of what this
+        // host serves: the receipt is about the current set.
+        if (!sameStack(stack, agentDistroSettingStore.get().profiles))
+          deliveryDropped(stack);
+        else deliveryFailed(stack, report.message);
         return;
-      case "landed":
+      case "landed": {
+        // A delivery of a stack the setting has since left (the list changed
+        // while it ran) must not replace the set the current stack landed —
+        // new terminals would get nothing until the next delivery. It is no
+        // failure of this host's either, so the receipt keeps what it says.
+        const current = agentDistroSettingStore.get().profiles;
+        if (!sameStack(stack, current)) {
+          deliveryDropped(stack);
+          throw new Error(
+            `kolu-server reported a landing for ${JSON.stringify(stack)}, but the Agents setting is now ${JSON.stringify(current)}; the set this host serves is kept`,
+          );
+        }
         try {
-          landDelivery(profile, report.bundle);
+          landDelivery(bake, report.set);
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          deliveryFailed(profile.name, { message }, "padi");
+          deliveryFailed(
+            stack,
+            err instanceof Error ? err.message : String(err),
+            "padi",
+          );
           throw err;
         }
         return;
+      }
       default:
         report satisfies never;
     }
@@ -255,7 +242,29 @@ export function onAgentDistroReport(report: AgentDistroDeliveryReport): void {
 /** Publish the receipt and status for the setting padi boots with. Called
  *  once, at boot. */
 export function publishAgentDistroAtBoot(): void {
+  sweepGcRootsAtBoot();
   const setting = agentDistroSettingStore.get();
   publishReceiptLoud(setting);
   settle(setting);
+}
+
+/** At boot, before kolu-server has pushed or delivered anything, remove every
+ *  GC root but those of the set this host serves — so a host whose agents are
+ *  off (no delivery ever lands to prune) still drops what an older kolu rooted
+ *  (a per-profile bundle's bare-name root). A set on record this host cannot
+ *  read is the status's to report: nothing is swept then. */
+function sweepGcRootsAtBoot(): void {
+  const bake = agentDistroBake();
+  if (bake === null) return;
+  let served: ReturnType<typeof servedSetOnHost>;
+  try {
+    served = servedSetOnHost(bake);
+  } catch (err) {
+    log.error(
+      { err },
+      "agent-distro GC roots not swept: the served set does not read",
+    );
+    return;
+  }
+  pruneGcRoots(bake.gcRootsDir, served?.profiles.map((p) => p.reference) ?? []);
 }

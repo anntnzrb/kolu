@@ -14,6 +14,8 @@ import {
   migratePreferences_1_38_0,
   migratePreferences_1_39_0,
   migratePreferences_1_40_0,
+  migratePreferences_1_41_0,
+  migratePreferences_1_42_0,
   store,
 } from "./state.ts";
 
@@ -229,22 +231,113 @@ describe("migratePreferences_1_40_0 — remembered profiles, and juspay becomes 
   });
 });
 
+describe("migratePreferences_1_41_0 — one profile becomes the stack", () => {
+  const base = { ...DEFAULT_PREFERENCES } as Record<string, unknown>;
+  const stored = (agentDistro: unknown) =>
+    migratePreferences_1_41_0({ ...base, agentDistro }).agentDistro;
+
+  it("vanilla (the harnesses alone) becomes the empty stack, on or off", () => {
+    for (const enabled of [true, false])
+      expect(stored({ enabled, profile: "vanilla" })).toEqual({
+        enabled,
+        profiles: [],
+      });
+  });
+
+  it("any other profile becomes the stack's one entry, on or off", () => {
+    for (const enabled of [true, false])
+      expect(stored({ enabled, profile: "github:me/p" })).toEqual({
+        enabled,
+        profiles: ["github:me/p"],
+      });
+    expect(stored({ enabled: true, profile: "~/my-profile" })).toEqual({
+      enabled: true,
+      profiles: ["~/my-profile"],
+    });
+  });
+
+  it("never chosen (null) stays null, and the rest of the record is kept", () => {
+    expect(stored(null)).toBeNull();
+    const pre = { ...base, agentDistro: null, seenTips: ["x"] };
+    expect(migratePreferences_1_41_0(pre)).toEqual(pre);
+  });
+
+  it("a record already in the new shape is returned untouched", () => {
+    const current = {
+      ...base,
+      agentDistro: { enabled: true, profiles: ["a", "b"] },
+    };
+    expect(migratePreferences_1_41_0(current)).toBe(current);
+  });
+
+  it("only agentDistro moves", () => {
+    const pre = {
+      ...base,
+      agentProfilesRecent: ["github:me/p"],
+      agentDistro: { enabled: true, profile: "github:me/p" },
+    };
+    expect(migratePreferences_1_41_0(pre)).toEqual({
+      ...pre,
+      agentDistro: { enabled: true, profiles: ["github:me/p"] },
+    });
+  });
+});
+
+describe("migratePreferences_1_42_0 — Juspay leaves the stack: it is opt-in", () => {
+  const base = { ...DEFAULT_PREFERENCES } as Record<string, unknown>;
+  const JUSPAY = "github:juspay/skills";
+
+  it("takes Juspay's reference out of the stack and the remembered references, keeping the rest in order", () => {
+    expect(
+      migratePreferences_1_42_0({
+        ...base,
+        agentDistro: {
+          enabled: true,
+          profiles: ["~/a", JUSPAY, "github:me/p"],
+        },
+        agentProfilesRecent: [JUSPAY, "~/a"],
+      }),
+    ).toMatchObject({
+      agentDistro: { enabled: true, profiles: ["~/a", "github:me/p"] },
+      agentProfilesRecent: ["~/a"],
+    });
+  });
+
+  it("a stack of Juspay alone becomes empty; never chosen stays null", () => {
+    expect(
+      migratePreferences_1_42_0({
+        ...base,
+        agentDistro: { enabled: true, profiles: [JUSPAY] },
+      }).agentDistro,
+    ).toEqual({ enabled: true, profiles: [] });
+    expect(
+      migratePreferences_1_42_0({ ...base, agentDistro: null }).agentDistro,
+    ).toBeNull();
+  });
+});
+
 describe("the CHAINED preference ladder (a pre-1.30 blob walking every rung)", () => {
   /** The rungs that read the `preferences` blob, in ladder order. 1.31.0 /
    *  1.33.0 / 1.35.0 / 1.36.0 never touch it (key strip, `hosts` seed, no-op,
-   *  `viewerMode` seed), so these seven (1.37.0 seeds `agentDistro`, 1.38.0 turns
+   *  `viewerMode` seed), so these eight (1.37.0 seeds `agentDistro`, 1.38.0 turns
    *  an Off one into "never chosen", 1.39.0 seeds `tipBarCollapsed`, 1.40.0
-   *  seeds `agentProfilesRecent`) ARE the whole walk a pre-1.30 file
+   *  seeds `agentProfilesRecent`, 1.41.0 turns `profile` into `profiles`,
+   *  1.42.0 takes Juspay's reference out of a stack that reached 1.41.0) ARE
+   *  the whole walk a pre-1.30 file
    *  makes. Testing each rung in isolation cannot catch a cross-rung defect:
    *  1.32.0 spreads today's `DEFAULT_PREFERENCES` into the record, which hands
    *  1.34.0 an `attentionAlerts` the user never chose. */
   const walkLadder = (blob: Record<string, unknown>) =>
-    migratePreferences_1_40_0(
-      migratePreferences_1_39_0(
-        migratePreferences_1_38_0(
-          migratePreferences_1_37_0(
-            migratePreferences_1_34_0(
-              migratePreferences_1_32_0(migratePreferences_1_30_0(blob)),
+    migratePreferences_1_42_0(
+      migratePreferences_1_41_0(
+        migratePreferences_1_40_0(
+          migratePreferences_1_39_0(
+            migratePreferences_1_38_0(
+              migratePreferences_1_37_0(
+                migratePreferences_1_34_0(
+                  migratePreferences_1_32_0(migratePreferences_1_30_0(blob)),
+                ),
+              ),
             ),
           ),
         ),
@@ -279,6 +372,33 @@ describe("the CHAINED preference ladder (a pre-1.30 blob walking every rung)", (
     const migrated = walkLadder(pre_1_30(true));
     expect(migrated.attentionAlerts).toBe(true);
     expect(migrated).not.toHaveProperty("activityAlerts");
+  });
+
+  it("a 1.37-era Agents choice walks the agent rungs into the stack", () => {
+    const walkAgents = (agentDistro: unknown) =>
+      migratePreferences_1_42_0(
+        migratePreferences_1_41_0(
+          migratePreferences_1_40_0(
+            migratePreferences_1_39_0(
+              migratePreferences_1_38_0({ ...pre_1_30(), agentDistro }),
+            ),
+          ),
+        ),
+      ).agentDistro;
+    // juspay was a bundle, then a reference (1.40) — and, once the
+    // never-chosen default, it never becomes an entry: Juspay is opt-in.
+    expect(walkAgents({ enabled: true, profile: "juspay" })).toEqual({
+      enabled: true,
+      profiles: [],
+    });
+    expect(walkAgents({ enabled: true, profile: "vanilla" })).toEqual({
+      enabled: true,
+      profiles: [],
+    });
+    // Off was never really chosen (1.38), and stays so.
+    expect(walkAgents({ enabled: false, profile: "vanilla" })).toBeNull();
+    // A pre-1.37 file never chose at all.
+    expect(walkLadder(pre_1_30()).agentDistro).toBeNull();
   });
 
   it("a blob that never set activityAlerts lands on the default", () => {

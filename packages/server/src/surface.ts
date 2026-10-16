@@ -55,7 +55,10 @@ import {
   type SurfaceHandlers,
 } from "@kolu/surface/server";
 import { surfaceAppServer } from "@kolu/surface-app/server";
-import type { AgentDistroSetting } from "@kolu/agent-distro/schema";
+import type {
+  AgentDistroSetting,
+  AgentProfiles,
+} from "@kolu/agent-distro/schema";
 import type { HostKey } from "kolu-common/hostKey";
 import { agentDistroSettingOf } from "@kolu/agent-distro/status";
 import { Effect } from "effect";
@@ -205,6 +208,13 @@ export function currentNewTerminalPolicy(): NewTerminalPolicy {
   );
 }
 
+/** Whether each profile of the Agents setting builds — served as the
+ *  `agentProfiles` cell. Memory-only: a restarted kolu-server builds them again
+ *  on its first run. Written ONLY through the cell (`setAgentProfiles`, below):
+ *  a write to this store alone would reach no subscriber. */
+const agentProfilesStore: CellStore<AgentProfiles> =
+  inMemoryStore<AgentProfiles>([]);
+
 /** The Agents setting the padi pusher publishes — the user's preference read off
  *  the SAME store the `preferences` cell serves, through the one fold that turns
  *  "never chosen" (`null`) into off. padi's wire never sees the `null`. */
@@ -280,7 +290,7 @@ export interface KoluSurfaceDeps {
    *  (every connected host for `null`) now — `./agentDelivery/install.ts`'s
    *  `deliverNow`, or a no-op on a kolu built without agents. */
   deliverAgents: (host: HostKey | null) => void;
-  /** The agent-distro profile listing, read once at boot
+  /** The harnesses the floor's package brings, read once at boot
    *  (`./agentDistroListing.ts`) — the `agentDistroListing` cell's only value. */
   agentDistroListing: AgentDistroListing;
 }
@@ -404,6 +414,8 @@ export function implementKoluSurface(deps: KoluSurfaceDeps) {
       },
       // The build's agent-distro profiles, read once at boot. Never written.
       agentDistroListing: { store: inMemoryStore(deps.agentDistroListing) },
+      // Whether each profile of the setting builds; the agent delivery writes it.
+      agentProfiles: { store: agentProfilesStore },
       // The viewer's raw OS light/dark reading — the other half of the policy, written
       // by the browser and remembered on disk (see `viewerModeStore`). Same `onWrite`
       // nudge for the same reason; the scalar `equals` lives on the spec, so a browser
@@ -597,15 +609,22 @@ export function implementKoluSurface(deps: KoluSurfaceDeps) {
   // out their server-internal writers, narrowly, for the state-backup restore
   // (#1658): `ctx.cells.<key>.set` is the framework's sanctioned in-process write
   // path for a store cell (dedupe + `onWrite` + publish ride along), and returning
-  // just these two keeps the graph-owned members unreachable.
+  // just these two keeps the graph-owned members unreachable. The agent
+  // delivery's answers for the `agentProfiles` cell take the same path, as
+  // their own writer (they are no backup's to restore).
   return {
     group: koluSurfaces.group,
     handlers: koluSurfaces.handlers,
+    setAgentProfiles: (value: AgentProfiles) =>
+      koluSurfaces.ctx.kolu.cells.agentProfiles.set(value),
     storeCellWriters: {
       setPreferences: (value) =>
         koluSurfaces.ctx.kolu.cells.preferences.set(value),
       setViewerMode: (value) =>
         koluSurfaces.ctx.kolu.cells.viewerMode.set(value),
     },
-  } satisfies ServedFragment & { storeCellWriters: StoreCellWriters };
+  } satisfies ServedFragment & {
+    storeCellWriters: StoreCellWriters;
+    setAgentProfiles: (value: AgentProfiles) => void;
+  };
 }
