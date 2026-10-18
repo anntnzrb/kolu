@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { RestoreTarget } from "anyagent/schemas";
 import {
   agentKindFromCommand,
+  agentNameFromCommand,
   exactRestoreTarget,
   parseAgentCommand,
   resumableCommand,
@@ -1061,5 +1062,165 @@ describe("agentKindFromCommand", () => {
     expect(agentKindFromCommand("cursor-agent")).toBe(null);
     expect(agentKindFromCommand("vim")).toBe(null);
     expect(agentKindFromCommand("")).toBe(null);
+  });
+});
+
+// Incident: splits launched by an orchestrator as `AI_PROFILE=… opencode --auto`
+// came back as bare shells after a kaval restart — the parser read
+// `AI_PROFILE=…` as the binary, so no launch command was ever recorded. Every
+// head reader now reads through the POSIX simple-command prefix.
+describe("launch lines with an env / exec / env-wrapper prefix", () => {
+  // [raw 633;E line, normalized] — assignments are KEPT (a resume must replay
+  // the same profile/config); `exec` / `env` are dropped.
+  it.each([
+    ["FOO=bar opencode", "FOO=bar opencode"],
+    [
+      "AI_PROFILE=github:juspay/skills opencode --auto",
+      "AI_PROFILE=github:juspay/skills opencode",
+    ],
+    [`A=1 B='x y' claude --model sonnet`, `A=1 B='x y' claude --model sonnet`],
+    [`A=1 B="x y" claude --model sonnet`, `A=1 B='x y' claude --model sonnet`],
+    // The incident's second line, verbatim.
+    [
+      `OPENCODE_CONFIG_CONTENT='{"model":"opencode/deepseek-v4.1-flash"}' opencode --auto`,
+      `OPENCODE_CONFIG_CONTENT='{"model":"opencode/deepseek-v4.1-flash"}' opencode`,
+    ],
+    // string-argv keeps the mid-word quotes; the space and inner double quotes
+    // must survive the dequote → re-quote.
+    [
+      `OPENCODE_CONFIG_CONTENT='{"model": "x y"}' opencode`,
+      `OPENCODE_CONFIG_CONTENT='{"model": "x y"}' opencode`,
+    ],
+    ["EMPTY= opencode", "EMPTY= opencode"],
+    ["exec omp --model fable", "omp --model fable"],
+    ["FOO=1 exec omp", "FOO=1 omp"],
+    ["env FOO=1 codex", "FOO=1 codex"],
+    ["A=1 env B=2 codex --yolo", "A=1 B=2 codex --yolo"],
+    ["FOO=bar /usr/local/bin/claude", "FOO=bar claude"],
+  ])("raw line %j → %j", (raw, expected) => {
+    expect(parseAgentCommand(raw)).toBe(expected);
+  });
+
+  // The command-rooted seed dialect (`shellJoin(argv)`, reparsed by
+  // `shellSplit`) goes through the SAME anatomy.
+  it.each([
+    [shellJoin(["exec", "omp", "--model", "fable"]), "omp --model fable"],
+    [shellJoin(["env", "FOO=1", "codex"]), "FOO=1 codex"],
+    [`B='x y' claude --model sonnet`, `B='x y' claude --model sonnet`],
+    // The incident lines as a command-rooted argv seed.
+    [
+      shellJoin(["AI_PROFILE=github:juspay/skills", "opencode", "--auto"]),
+      "AI_PROFILE=github:juspay/skills opencode",
+    ],
+    [
+      shellJoin([
+        'OPENCODE_CONFIG_CONTENT={"model":"opencode/deepseek-v4.1-flash"}',
+        "opencode",
+        "--auto",
+      ]),
+      `OPENCODE_CONFIG_CONTENT='{"model":"opencode/deepseek-v4.1-flash"}' opencode`,
+    ],
+    [
+      shellJoin(['OPENCODE_CONFIG_CONTENT={"model": "x y"}', "opencode"]),
+      `OPENCODE_CONFIG_CONTENT='{"model": "x y"}' opencode`,
+    ],
+  ])("shellJoin seed %j → %j", (seed, expected) => {
+    expect(parseAgentCommand(seed, true)).toBe(expected);
+  });
+
+  it.each([
+    "env -i opencode", // env's own flags — don't guess
+    "env -u HOME opencode",
+    "exec -a name opencode",
+    "FOO=bar ls", // not an agent
+    "FOO=bar", // no binary at all
+    "env FOO=1",
+    "exec",
+    "FOO=bar opencode --version", // the exit flag still wins
+    "cd x && opencode", // non-goal: compound commands stay unrecognized
+  ])("returns null for %j", (raw) => {
+    expect(parseAgentCommand(raw)).toBeNull();
+    expect(parseAgentCommand(raw, true)).toBeNull();
+  });
+
+  it("reads the kind and name behind the prefix", () => {
+    expect(agentKindFromCommand("FOO=bar opencode")).toBe("opencode");
+    expect(agentKindFromCommand(`A=1 B='x y' claude --model sonnet`)).toBe(
+      "claude-code",
+    );
+    expect(agentKindFromCommand("FOO=bar ls")).toBeNull();
+    expect(
+      agentNameFromCommand("AI_PROFILE=github:juspay/skills opencode"),
+    ).toBe("opencode");
+    expect(agentNameFromCommand(`B='x y' claude --model sonnet`)).toBe(
+      "claude",
+    );
+    expect(agentNameFromCommand("claude")).toBe("claude");
+    expect(agentNameFromCommand("")).toBeNull();
+  });
+
+  it("resumes the JSON incident line with its config value intact", () => {
+    const OPENCODE_ID = "ses_118316090ffewMmbj6bsfKwj4R";
+    const command = parseAgentCommand(
+      `OPENCODE_CONFIG_CONTENT='{"model": "x y"}' opencode --auto`,
+    );
+    if (command === null) throw new Error("not recognized");
+    const resumed = resumeAgentCommand(command, {
+      kind: "opencode",
+      sessionId: OPENCODE_ID,
+      resumeRef: OPENCODE_ID,
+    });
+    expect(resumed).toBe(
+      `OPENCODE_CONFIG_CONTENT='{"model": "x y"}' opencode --session ${OPENCODE_ID}`,
+    );
+    // What a shell re-reading the resume line would see.
+    expect(shellSplit(resumed as string)).toEqual([
+      'OPENCODE_CONFIG_CONTENT={"model": "x y"}',
+      "opencode",
+      "--session",
+      OPENCODE_ID,
+    ]);
+  });
+
+  it("keeps the assignments in front of the head across the resume splice", () => {
+    expect(resumeAgentCommand("FOO=bar opencode")).toBe(
+      "FOO=bar opencode --continue",
+    );
+    expect(resumeAgentCommand(`A=1 B='x y' claude --model sonnet`)).toBe(
+      `A=1 B='x y' claude -c --model sonnet`,
+    );
+    expect(resumeAgentCommand("FOO=1 aider")).toBeNull(); // detection-only
+  });
+
+  // A command that was never normalized can still arrive from disk (the
+  // cutover migration copies any stored string) — refuse it, don't crash.
+  it("refuses a command that was never normalized", () => {
+    expect(resumeAgentCommand("exec claude")).toBeNull();
+    expect(resumeAgentCommand("env FOO=1 claude")).toBeNull();
+    expect(
+      resumableCommand({ kind: "legacyMostRecent", command: "exec claude" }),
+    ).toBeNull();
+  });
+
+  // The whole chain the incident broke: raw line → normalized → kind gate →
+  // exact restore target → resume form, with the profile still in front.
+  it("round-trips a prefixed opencode launch to an exact resume", () => {
+    const OPENCODE_ID = "ses_118316090ffewMmbj6bsfKwj4R";
+    const command = parseAgentCommand(
+      "AI_PROFILE=github:juspay/skills opencode --auto",
+    );
+    expect(command).toBe("AI_PROFILE=github:juspay/skills opencode");
+    if (command === null) throw new Error("unreachable");
+    expect(agentKindFromCommand(command)).toBe("opencode");
+    const target = exactRestoreTarget(command, {
+      kind: "opencode",
+      sessionId: OPENCODE_ID,
+      resumeRef: OPENCODE_ID,
+    });
+    expect(target?.kind).toBe("exact");
+    expect(resumeFormFor(target ?? undefined)).toBe(
+      `AI_PROFILE=github:juspay/skills opencode --session ${OPENCODE_ID}`,
+    );
+    expect(resumableCommand(target ?? undefined)).toBe(command);
   });
 });
