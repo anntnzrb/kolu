@@ -1,19 +1,9 @@
 {
   "mcpServers": {
-    "chrome-devtools": {
-      "type": "stdio",
-      "command": ".claude/skills/nix-chrome-devtools-mcp/bin/serve",
-      "args": []
-    },
     "kolu": {
       "type": "stdio",
       "command": "kolu",
-      "args": [
-        "mcp"
-      ],
-      "env_vars": [
-        "PADI_SOCKET"
-      ]
+      "args": ["mcp"]
     }
   }
 }

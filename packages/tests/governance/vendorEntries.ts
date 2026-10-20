@@ -50,10 +50,10 @@ import {
   workspacePackageRoots,
 } from "@kolu/daemon-test-gate/runtimeDepEdges";
 
-/** The surface stack drishti and odu copy (see `packages/AGENTS.md`), read off
- *  the tree rather than listed: a workspace package root at exactly
- *  `packages/surface<…>` — not `packages/surface/example`, which is a sub-package
- *  of one, and not `packages/surfaced-thing` living deeper. */
+/** The surface stack drishti and odu copy (see `dev/skills/surface/SKILL.md`),
+ *  read off the tree rather than listed: a workspace package root at exactly
+ *  `packages/surface<…>` — not `packages/surface/example`, which is a
+ *  sub-package of one, and not `packages/surfaced-thing` living deeper. */
 const SURFACE_DIR = /^packages\/surface[^/]*$/;
 
 /** The package DIRECTORIES an outside repo copies out of a content-addressed
