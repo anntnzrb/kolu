@@ -46,7 +46,15 @@ import { rpcSerializationLayer } from "../frameLimit";
 import { RpcClientError } from "effect/rpc/RpcClientError";
 import { Socket } from "effect/socket";
 import { SurfaceStdioTransportClosed } from "../errors";
+import { RPC_PING_FATAL_SILENCE_MS, RPC_PING_INTERVAL_MS } from "../keepAlive";
 import { brandHalfOpenDispatch, type SurfaceDispatch } from "../link";
+
+/** How often `RpcClient.makeProtocolSocket`'s own pinger writes a ping, and the
+ *  worst-case silence it tolerates before ending the socket run — Effect's
+ *  numbers, OBSERVED, not knobs we own. Re-exported from `../keepAlive` (the
+ *  leaflet that owns them) so this subpath's importers keep one import path;
+ *  the canonical account of the MECHANISM is `keepAliveWentUnanswered` below. */
+export { RPC_PING_FATAL_SILENCE_MS, RPC_PING_INTERVAL_MS };
 
 /** The retry schedule for a link bound to one stream pair: halt on the first
  *  failure. Not a policy knob — a re-dial would re-acquire the SAME dead fds,
@@ -66,29 +74,6 @@ const neverReconnect: Schedule.Schedule<number, Socket.SocketError> =
       Cause.done(meta.attempt),
     ),
   );
-
-/** How often `RpcClient.makeProtocolSocket`'s own pinger writes a ping.
- *
- *  **Effect's number, OBSERVED — not a knob we own.** `makeProtocolSocket`
- *  exposes no option for the cadence, so nothing here sets it and nothing here
- *  can move it; this constant exists so the repo's other reasoning about link
- *  silence can REFERENCE the fact instead of transcribing it. See
- *  {@link RPC_PING_FATAL_SILENCE_MS} and, for the whole mechanism,
- *  `keepAliveWentUnanswered` below — the canonical account. `stdioPingStall.test.ts`
- *  measures the behaviour; if Effect ever changes it, that docstring changes
- *  first and these two follow. */
-export const RPC_PING_INTERVAL_MS = 5_000;
-
-/** The worst-case silence Effect's pinger tolerates on a CONNECTED link before
- *  it ends the socket run: one interval to notice the previous ping went
- *  unanswered, on top of the interval that sent it. Also observed, also not a
- *  knob — see {@link RPC_PING_INTERVAL_MS}.
- *
- *  This is the bound that actually ends a connected link in this stack. Every
- *  other silence budget in the repo — the heartbeat watchdog, the provisioning
- *  child-lifetime budgets, `@kolu/surface-remote`'s ssh keepalive — sits above
- *  it and gets no vote while a link is connected. */
-export const RPC_PING_FATAL_SILENCE_MS = RPC_PING_INTERVAL_MS * 2;
 
 /** What every wire link factory returns: the dispatch the face binds against,
  *  plus the release of the scope the link opened. `dispose` is idempotent and

@@ -432,4 +432,108 @@ describe("createHeartbeat (lifted primitive)", () => {
     // A sane minute-scale cadence is still allowed.
     expect(() => make(60_000).dispose()).not.toThrow();
   });
+
+  // ── "Liveness is PROGRESS" ────────────────────────────────────────────────
+  //
+  // A slow-but-flowing link (a multi-MB snapshot arriving over a cellular
+  // tether) starves the round-trip probe's own answer while frames keep arriving
+  // — so a timed-out probe must be VOIDED, not read as half-open, when inbound
+  // activity advanced at or past the probe's launch. The reading is the
+  // transport's (`WireTransport.lastInboundAt`); here it is injected so the
+  // verdict is pinned framework-free.
+  describe("liveness is progress (lastActivity)", () => {
+    it("VOIDS a timed-out probe when a frame arrived during its window — no onStale, re-probes", async () => {
+      let monoMs = 0;
+      let lastIn = Number.NEGATIVE_INFINITY;
+      const onStale = vi.fn();
+      const probe = vi.fn(() => new Promise<never>(() => {})); // never answers
+      const { dispose } = createHeartbeat({
+        isLive: () => true,
+        onStale,
+        probe,
+        intervalMs: 1000,
+        timeoutMs: 500,
+        deps: { now: () => monoMs, mono: () => monoMs },
+        lastActivity: () => lastIn,
+      });
+      await vi.advanceTimersByTimeAsync(1000); // tick → probe launched at mono 0
+      expect(probe).toHaveBeenCalledTimes(1);
+      // A frame lands mid-window (a slow snapshot chunk): the link is alive.
+      monoMs = 400;
+      lastIn = 400;
+      await vi.advanceTimersByTimeAsync(500); // timeout → VOID, not stale
+      expect(onStale).not.toHaveBeenCalled();
+      expect(probe).toHaveBeenCalledTimes(2); // re-probed immediately, fresh window
+      dispose();
+    });
+
+    it("a socket that keeps a frame flowing but never answers the probe still goes stale — the progress-void is BUDGETED", async () => {
+      // The RPC protocol's own PONG is inbound activity, every interval, on every
+      // healthy socket. Without a budget the progress-void would fire on every
+      // probe and the watchdog could never go stale on a socket that pongs but
+      // does not serve. The budget converts repeated voids into a stale verdict.
+      const onStale = vi.fn();
+      const { dispose } = createHeartbeat({
+        isLive: () => true,
+        onStale,
+        probe: () => new Promise<never>(() => {}), // never answers
+        intervalMs: 1000,
+        timeoutMs: 500,
+        // Lockstep fake clocks: `Date.now()` advances with the fake timers.
+        deps: { now: () => Date.now(), mono: () => Date.now() },
+        // Inbound activity is ALWAYS present (a pong every interval).
+        lastActivity: () => Date.now(),
+      });
+      // Inside the void budget ((1000 + 500) × 3 = 4500ms) the probe is voided —
+      // the link is flowing, so it is not yet declared stale.
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(onStale).not.toHaveBeenCalled();
+      // Past the budget the void converts to stale: a peer that pongs while never
+      // answering the probe is still recovered.
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(onStale).toHaveBeenCalledTimes(1);
+      dispose();
+    });
+
+    it("a frame that arrived BEFORE the probe launched does NOT excuse the window", async () => {
+      // The comparison is against the launch's monotonic reading, so activity
+      // that predates the probe cannot mask a genuinely silent window.
+      let monoMs = 0;
+      const lastIn = 300;
+      const onStale = vi.fn();
+      const { dispose } = createHeartbeat({
+        isLive: () => true,
+        onStale,
+        probe: () => new Promise<never>(() => {}), // never answers — truly dead
+        intervalMs: 1000,
+        timeoutMs: 500,
+        deps: { now: () => monoMs, mono: () => monoMs },
+        lastActivity: () => lastIn,
+      });
+      monoMs = 400; // launch lands AFTER the last frame
+      await vi.advanceTimersByTimeAsync(1000); // tick → probe launched at mono 400
+      monoMs = 900;
+      await vi.advanceTimersByTimeAsync(500); // timeout: 300 < 400 → genuine stale
+      expect(onStale).toHaveBeenCalledTimes(1);
+      dispose();
+    });
+
+    it("is silence-only when no reading is supplied — the unchanged behaviour", async () => {
+      let monoMs = 0;
+      const onStale = vi.fn();
+      const { dispose } = createHeartbeat({
+        isLive: () => true,
+        onStale,
+        probe: () => new Promise<never>(() => {}),
+        intervalMs: 1000,
+        timeoutMs: 500,
+        deps: { now: () => monoMs, mono: () => monoMs },
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      monoMs = 500;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(onStale).toHaveBeenCalledTimes(1);
+      dispose();
+    });
+  });
 });

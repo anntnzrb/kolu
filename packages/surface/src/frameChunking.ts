@@ -72,6 +72,67 @@
  */
 
 import { RPC_MAX_FRAME_BYTES } from "./frameLimit.ts";
+import { RPC_PING_INTERVAL_MS } from "./keepAlive.ts";
+
+/** Raw bytes one OUTBOUND STREAM frame may carry of user content — the budget a
+ *  multi-entry collection snapshot (or any stream frame that scales with user
+ *  content) is split into before it reaches the wire.
+ *
+ *  ## Why the cap is NOT the budget (the drain arithmetic)
+ *
+ *  {@link RPC_MAX_FRAME_BYTES} answers "will the decoder reject this frame?"; it
+ *  is the 16 MiB backstop, far too large to answer "will this frame starve the
+ *  link's own keep-alive while it drains?". Effect's pinger (see
+ *  `./keepAlive.ts`) writes a ping every {@link RPC_PING_INTERVAL_MS} and ends the
+ *  socket run the moment a tick finds the previous ping unanswered — so a frame
+ *  the server is still pushing when the next tick fires can take the whole
+ *  connection down, and every subscription multiplexed onto that socket with it.
+ *  A frame that is legal by the size cap can therefore still be FATAL by time.
+ *
+ *  A subscription's frames are ACK-GATED (`RpcServer.streamEffect` waits for the
+ *  client's ack before the next Chunk), so at most ONE chunk is ever in flight:
+ *  the transport buffer never holds a backlog of this stream, and a pong written
+ *  while a chunk drains queues behind that one chunk and no more. The bound that
+ *  matters is therefore "time to drain ONE chunk", and it must sit comfortably
+ *  inside the ping interval — not the 10s fatal window — so the pong always beats
+ *  the next tick:
+ *
+ *     budget  = floor_bandwidth × (RPC_PING_INTERVAL_MS / safety)
+ *
+ *  Take a cellular tether measured at ~1 Mbit/s ≈ 128 KiB/s as the floor worth
+ *  serving (below it a multi-MB snapshot is bandwidth-bound no matter how it is
+ *  framed), and a safety factor of 2.5 against the interval:
+ *
+ *     drain:  262144 / 131072 = 2.00s      (at the 1 Mbit/s floor)
+ *     + RTT:  ~0.5s on the same link       (the ack that gates the next chunk)
+ *     total:  ~2.5s < 5s  (RPC_PING_INTERVAL_MS, 2x headroom)
+ *                     < 10s (RPC_PING_FATAL_SILENCE_MS, 4x headroom)
+ *
+ *  256 KiB is also a round power of two (a clean slice of the log line, and far
+ *  enough under the 16 MiB cap — 1.5% — that the chunk never trips the decoder).
+ *  A 5 MB transcript then costs ~20 chunks; the ack round trips add ~10s of dead
+ *  time at a 200ms RTT, against ~39s of pure transmission at 1 Mbit/s — an
+ *  acceptable tax for a link that stays alive.
+ *
+ *  BAKED, not a knob: a tunable would be a way to reintroduce the starvation.
+ *
+ *  ## The bound is per STREAM — and the socket is shared
+ *
+ *  Ack-gating bounds ONE stream to a single part in flight, but a reconnect
+ *  re-subscribes every collection on the socket at once, so up to K parts can sit
+ *  on the wire together (K = the collections whose snapshot exceeds this budget),
+ *  and the pong queues behind all K rather than one. K is small in practice: a
+ *  collection's snapshot is a SINGLE frame unless it exceeds the budget, and the
+ *  incident this exists for is one such collection (a long transcript, K = 1 →
+ *  ~2s at the 1 Mbit/s floor). Stated honestly: K large snapshots resuming
+ *  together on a 1 Mbit/s link can delay the pong past the ping interval — the
+ *  per-stream bound does not become a per-CONNECTION one, and a connection-level
+ *  part gate (one part in flight per socket) is the follow-up. It is deferred
+ *  rather than denied because a handler cannot see its connection, and the
+ *  alternative — a budget small enough that K of them still fit — multiplies the
+ *  ack round trips on EVERY transfer to buy headroom for a case the measured
+ *  incident never reaches. */
+export const RPC_STREAM_CHUNK_BYTES = 256 * 1024;
 
 /** What everything on the frame OTHER than the base64 payload is budgeted at:
  *  the procedure path, the request id, the member's own ids, a destination

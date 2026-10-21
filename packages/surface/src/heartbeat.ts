@@ -141,6 +141,24 @@ export interface HeartbeatOptions {
   /** How long to wait for a probe before declaring the link half-open and running
    *  `onStale`. Default {@link DEFAULT_HEARTBEAT_TIMEOUT_MS}. */
   timeoutMs?: number;
+  /** A monotonic-millisecond reading of the last INBOUND activity on the link —
+   *  any frame the transport has received. When a probe TIMES OUT but
+   *  `lastActivity()` has advanced at or past the probe's launch, the link is
+   *  demonstrably ALIVE (it is flowing, just slowly), so the verdict is VOIDED
+   *  and the probe re-run rather than declaring a healthy-but-busy link
+   *  half-open. This is the "liveness is PROGRESS" rule: a multi-MB snapshot
+   *  arriving over a cellular tether starves the round-trip probe's own answer,
+   *  yet the link is plainly making progress. Omit it (a transport that cannot
+   *  report inbound activity) and the watchdog falls back to silence-only.
+   *
+   *  BOUNDED by the same running-time budget as the suspension void
+   *  ({@link VOID_BUDGET_FACTOR}): a peer that keeps a frame flowing (the RPC
+   *  protocol's own pong, every interval) while never answering the probe must
+   *  still be declared stale once the budget is spent — otherwise this branch
+   *  would make the watchdog inert on EVERY connected socket, since a pong is
+   *  inbound activity too. The budget converts repeated voids into a stale
+   *  verdict; it never silences one. */
+  lastActivity?: () => number;
   /** Report a forced recovery (a missed probe). Optional — run guarded AFTER
    *  `onStale`, so it can never defeat the recovery. */
   onStaleReport?: () => void;
@@ -224,6 +242,9 @@ export function createHeartbeat(opts: HeartbeatOptions): {
   assertSaneMs("timeoutMs", timeoutMs, MAX_HEARTBEAT_TIMEOUT_MS);
   const now = opts.deps?.now ?? Date.now;
   const mono = opts.deps?.mono ?? monotonicNow;
+  // The inbound-activity reading (see `HeartbeatOptions.lastActivity`), resolved
+  // once. Absent ⇒ the watchdog is silence-only, exactly as before.
+  const lastActivity = opts.lastActivity;
   // The void-budget ceiling in monotonic (running-time) ms — see VOID_BUDGET_FACTOR.
   const voidBudgetMs = (intervalMs + timeoutMs) * VOID_BUDGET_FACTOR;
   let inFlight = false;
@@ -334,6 +355,39 @@ export function createHeartbeat(opts: HeartbeatOptions): {
     launchMono = mono();
     probeTimer = setTimeout(() => {
       if (disposed || gen !== generation || !inFlight) return;
+      // The running-time reading, taken once — both void paths below budget
+      // against it, so they cannot disagree about how long a verdict has been
+      // deferred.
+      const currentMono = mono();
+      // The budget shared by BOTH void paths: while it is unspent a void defers
+      // the verdict; once spent, the verdict fires — voiding may DEFER a stale
+      // verdict but must never SILENCE it.
+      const withinVoidBudget = currentMono - lastSettledMono <= voidBudgetMs;
+      // LIVENESS IS PROGRESS, checked FIRST because it is verdict-free: a frame
+      // arrived on this link during the probe's own window, so the link is
+      // demonstrably ALIVE (slow, busy, mid-snapshot) — never half-open, whatever
+      // the probe's answer did. Void and re-probe rather than force a reconnect
+      // that would only restart the big frame. Read at the TIMEOUT and compared
+      // against the launch's monotonic reading, so a frame that arrived before
+      // the probe started does not count.
+      //
+      // BUDGETED, exactly like the suspension void below, and that is
+      // load-bearing rather than tidy: the RPC protocol's own PONG is inbound
+      // activity, arriving every interval on every healthy socket, so without a
+      // budget this branch would void forever and the watchdog could NEVER fire
+      // stale on a socket that pongs but does not serve — inert on exactly the
+      // links it exists for. Once the budget is spent, the void falls through to
+      // the stale verdict, so a peer that pongs while the probe goes unanswered
+      // is still recovered.
+      if (
+        lastActivity !== undefined &&
+        lastActivity() >= launchMono &&
+        withinVoidBudget
+      ) {
+        abandon();
+        tick();
+        return;
+      }
       // Was the probe's window a fair, continuously-running one? If the wall clock
       // ran far ahead of the monotonic clock, the runtime was SUSPENDED across it
       // (the timer slept through the gap and fired overdue on resume) — VOID the
@@ -341,10 +395,9 @@ export function createHeartbeat(opts: HeartbeatOptions): {
       // link half-open. UNLESS the void budget is spent (a flap that has deferred a
       // verdict for too long of ACTUAL running time): then fall through and fire
       // stale, so voiding can never silence the watchdog.
-      const currentMono = mono();
       const suspended =
         now() - launchWall - (currentMono - launchMono) > SUSPENSION_SLACK_MS;
-      if (suspended && currentMono - lastSettledMono <= voidBudgetMs) {
+      if (suspended && withinVoidBudget) {
         abandon();
         tick(); // fresh, full-timeoutMs probe over a continuously-running window
         return;
