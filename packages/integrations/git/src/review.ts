@@ -278,6 +278,9 @@ export async function getStatus(
   }
 }
 
+/** Keep Pierre's expected `a/` / `b/` headers regardless of Git prefix config. */
+const DIFF_PREFIXES = ["--src-prefix=a/", "--dst-prefix=b/"];
+
 /** Single home for raw-diff parsing — every classification flag the wire
  *  schema gates rendering on lives here, not split across the result
  *  builder. */
@@ -404,8 +407,22 @@ export async function getDiff(
 
   try {
     const tracked = oldPath
-      ? await gitOutput(repoPath, ["diff", "-M", baseRev, "--", oldRel, rel])
-      : await gitOutput(repoPath, ["diff", baseRev, "--", rel]);
+      ? await gitOutput(repoPath, [
+          "diff",
+          ...DIFF_PREFIXES,
+          "-M",
+          baseRev,
+          "--",
+          oldRel,
+          rel,
+        ])
+      : await gitOutput(repoPath, [
+          "diff",
+          ...DIFF_PREFIXES,
+          baseRev,
+          "--",
+          rel,
+        ]);
 
     // Branch mode's file list comes from `git diff --name-status`, which
     // only surfaces files already in the diff — so `git diff <base> -- <f>`
@@ -423,6 +440,7 @@ export async function getDiff(
       if (!guard.ok) return guard;
       rawDiff = await gitOutput(repoPath, [
         "diff",
+        ...DIFF_PREFIXES,
         "--no-index",
         "--",
         "/dev/null",
