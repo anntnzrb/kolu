@@ -278,9 +278,6 @@ export async function getStatus(
   }
 }
 
-/** Keep Pierre's expected `a/` / `b/` headers regardless of Git prefix config. */
-const DIFF_PREFIXES = ["--src-prefix=a/", "--dst-prefix=b/"];
-
 /** Single home for raw-diff parsing — every classification flag the wire
  *  schema gates rendering on lives here, not split across the result
  *  builder. */
@@ -325,9 +322,30 @@ async function gitOutput(cwd: string, args: string[]): Promise<string> {
     // never quoted at all (that handles control chars/quotes/backslashes that
     // `quotePath=false` would still escape). Applied to every git call here so
     // the diff headers match the NUL-clean file list.
+    //
+    // The four `diff.*` pins keep the headers on the `a/` / `b/` shape that
+    // Pierre's `parsePatchFiles` on the client is the only reader of. A user's
+    // `diff.mnemonicPrefix` (`i/`, `w/`, `c/`), `diff.noprefix` (no prefix at
+    // all) or explicit `diff.srcPrefix`/`diff.dstPrefix` would otherwise leak
+    // into the `diff --git` / `---` / `+++` headers, losing the file name and
+    // breaking multi-file (directory ↔ file) lookups (#2317). The
+    // `srcPrefix`/`dstPrefix` keys are ignored by git < 2.45, but there the
+    // two `=false` pins already restore the `a/` / `b/` defaults.
     const { stdout } = await execFileP(
       "git",
-      ["-c", "core.quotePath=false", ...args],
+      [
+        "-c",
+        "core.quotePath=false",
+        "-c",
+        "diff.noprefix=false",
+        "-c",
+        "diff.mnemonicPrefix=false",
+        "-c",
+        "diff.srcPrefix=a/",
+        "-c",
+        "diff.dstPrefix=b/",
+        ...args,
+      ],
       {
         cwd,
         maxBuffer: 128 * 1024 * 1024,
@@ -407,22 +425,8 @@ export async function getDiff(
 
   try {
     const tracked = oldPath
-      ? await gitOutput(repoPath, [
-          "diff",
-          ...DIFF_PREFIXES,
-          "-M",
-          baseRev,
-          "--",
-          oldRel,
-          rel,
-        ])
-      : await gitOutput(repoPath, [
-          "diff",
-          ...DIFF_PREFIXES,
-          baseRev,
-          "--",
-          rel,
-        ]);
+      ? await gitOutput(repoPath, ["diff", "-M", baseRev, "--", oldRel, rel])
+      : await gitOutput(repoPath, ["diff", baseRev, "--", rel]);
 
     // Branch mode's file list comes from `git diff --name-status`, which
     // only surfaces files already in the diff — so `git diff <base> -- <f>`
@@ -440,7 +444,6 @@ export async function getDiff(
       if (!guard.ok) return guard;
       rawDiff = await gitOutput(repoPath, [
         "diff",
-        ...DIFF_PREFIXES,
         "--no-index",
         "--",
         "/dev/null",
